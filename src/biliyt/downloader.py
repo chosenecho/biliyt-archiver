@@ -287,6 +287,7 @@ class SyncEngine:
         after_entries = self.state.read_archive_entries(target.id)
         if downloaded_flag or len(after_entries) > len(before_entries):
             self.state.remove_failure(target.id, url)
+            self._index_downloaded_video(target, video_id)
             return "downloaded", "ok"
 
         # If yt-dlp exited cleanly without downloading or archiving, it was either
@@ -305,6 +306,30 @@ class SyncEngine:
 
         self.state.remove_failure(target.id, url)
         return "filtered", "被过滤条件或日期区间跳过"
+
+    def _index_downloaded_video(self, target: ResolvedTarget, video_id: str | None) -> None:
+        """Best-effort upsert of newly downloaded video's `.info.json` + `.srt` into SQLite."""
+        from .db import ArchiveDB, index_video_info_file
+
+        search_dirs = [target.download_dir]
+        if (target.download_dir / "videos").is_dir():
+            search_dirs.append(target.download_dir / "videos")
+
+        matched: list[Any] = []
+        for d in search_dirs:
+            if not d.exists():
+                continue
+            for p in d.glob("*.info.json"):
+                if video_id and f"[{video_id}]" in p.name:
+                    matched.append(p)
+        if not matched:
+            return
+        try:
+            with ArchiveDB(self.state.state_dir / "biliyt.db") as db:
+                for info_file in matched:
+                    index_video_info_file(db, target, info_file)
+        except Exception:
+            pass
 
     def _sleep_between_items(self, target: ResolvedTarget) -> None:
         low = target.rate_limit.sleep_interval

@@ -97,6 +97,9 @@ uv sync --python-preference only-system --python 3.12
 | `biliyt probe` | 轻量拉取列表并统计已归档/跳过/待下载数量 | `-t/--target`, `-p/--platform`, `-n/--limit`, `--show` |
 | `biliyt sync` | 执行增量下载、B 站全量扩展归档或失败重试，并写入 JSON 运行报告 | `-t/--target`, `-p/--platform`, `-n/--limit`, `--only`, `--full`, `--refresh-comments`, `--dry-run`, `--retry-failed` |
 | `biliyt status` | 展示各目标累计归档（视频/动态/专栏/评论）、待重试失败数与上次运行摘要 | `-c/--config` |
+| `biliyt db stats` | 查看 SQLite 归档库（`state/biliyt.db`）体积与各表行数 | `-c/--config` |
+| `biliyt db rebuild` | 从本地 `downloads/` 已有文件无损重建 SQLite 与全文索引 | `-t/--target`, `--reset` |
+| `biliyt search <词>` | 跨视频、字幕、动态、专栏、评论毫秒级本地全文检索 | `-t/--target`, `-k/--kind`, `-n/--limit` |
 
 ## 接入 Windows 定时任务
 
@@ -118,3 +121,4 @@ python -m pytest -v
 - [常见问题与运维排查（docs/troubleshooting.md）](docs/troubleshooting.md)
 - [B 站全量内容归档 PDR（docs/bilibili-full-archive-pdr.md）](docs/bilibili-full-archive-pdr.md)
 - [B 站全量内容归档 SOP（docs/bilibili-full-archive-sop.md）](docs/bilibili-full-archive-sop.md)
+- [SQLite 结构化存储与全文检索 SOP（docs/sqlite-storage-sop.md）](docs/sqlite-storage-sop.md)

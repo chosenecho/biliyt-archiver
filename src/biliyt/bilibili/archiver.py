@@ -138,6 +138,11 @@ class BilibiliArchiver:
         if self._on_event:
             self._on_event(event, payload)
 
+    def _open_db(self) -> Any:
+        from ..db import ArchiveDB
+
+        return ArchiveDB(self.state.state_dir / "biliyt.db")
+
     # ------------------------------------------------------------------
     # Lightweight probe
     # ------------------------------------------------------------------
@@ -275,6 +280,19 @@ class BilibiliArchiver:
                     fetched_at=fetched_at,
                 ),
             )
+            with self._open_db() as db:
+                db.upsert_profile(
+                    target_id=target.id,
+                    platform=target.platform.value,
+                    uid=uid,
+                    user_info=user_info,
+                    relation_stat=relation_stat,
+                    upstat=upstat,
+                    collections=collections,
+                    avatar_relpath=f"profile/{avatar_rel}" if avatar_rel else None,
+                    banner_relpath=f"profile/{banner_rel}" if banner_rel else None,
+                    fetched_at=fetched_at,
+                )
             stats.saved = 1
         except (BilibiliRiskControlError, BilibiliAuthError) as exc:
             stats.failed = 1
@@ -316,8 +334,19 @@ class BilibiliArchiver:
         )
         image_map = localizer.localize(img_urls, folder / "images", rel_prefix="images")
 
+        md_text = render_dynamic_markdown(item, image_map)
         _write_json(folder / "dynamic.json", item)
-        _write_text(folder / "dynamic.md", render_dynamic_markdown(item, image_map))
+        _write_text(folder / "dynamic.md", md_text)
+        rel_folder = folder.relative_to(target.download_dir).as_posix()
+        rel_imgs = [f"{rel_folder}/{rel}" for rel in image_map.values()]
+        with self._open_db() as db:
+            db.upsert_dynamic(
+                target_id=target.id,
+                item=item,
+                markdown_content=md_text,
+                images_relpaths=rel_imgs,
+                folder_relpath=rel_folder,
+            )
         return folder
 
     def sync_dynamics(
@@ -474,16 +503,24 @@ class BilibiliArchiver:
             "view": view_data,
             "opus_detail": opus_detail,
         }
-        _write_json(folder / "article.json", payload)
-        _write_text(
-            folder / "article.md",
-            render_article_markdown(
-                meta=meta,
-                opus_detail=opus_detail,
-                html_text=html_text,
-                image_map=image_map,
-            ),
+        md_text = render_article_markdown(
+            meta=meta,
+            opus_detail=opus_detail,
+            html_text=html_text,
+            image_map=image_map,
         )
+        _write_json(folder / "article.json", payload)
+        _write_text(folder / "article.md", md_text)
+        rel_folder = folder.relative_to(target.download_dir).as_posix()
+        rel_imgs = [f"{rel_folder}/{rel}" for rel in image_map.values()]
+        with self._open_db() as db:
+            db.upsert_article(
+                target_id=target.id,
+                payload=payload,
+                markdown_content=md_text,
+                images_relpaths=rel_imgs,
+                folder_relpath=rel_folder,
+            )
         return folder
 
     def sync_articles(
@@ -619,6 +656,12 @@ class BilibiliArchiver:
                     fav_dir / f"{base_name}.md",
                     render_favorite_folder_markdown(folder, medias),
                 )
+                with self._open_db() as db:
+                    db.upsert_favorite_folder(
+                        target_id=target.id,
+                        folder=folder,
+                        medias=medias,
+                    )
                 folder_copy = dict(folder)
                 folder_copy["_md_filename"] = f"{base_name}.md"
                 index_entries.append(folder_copy)
@@ -957,6 +1000,20 @@ class BilibiliArchiver:
                         up_uid=uid,
                     ),
                 )
+                carrier_kind_singular = {"videos": "video", "dynamics": "dynamic", "articles": "article"}.get(
+                    carrier.kind, carrier.kind
+                )
+                with self._open_db() as db:
+                    db.upsert_comments(
+                        target_id=target.id,
+                        carrier_kind=carrier_kind_singular,
+                        oid=carrier.oid,
+                        rtype=carrier.rtype,
+                        carrier_title=carrier.title,
+                        source_url=carrier.source_url,
+                        bundle=bundle,
+                        up_uid=uid,
+                    )
                 self.state.append_namespace_archive(
                     target.id,
                     "comments",

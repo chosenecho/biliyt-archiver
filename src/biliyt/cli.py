@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__
 from .config import AppConfig, ResolvedTarget, load_config, resolve_target
+from .db import ArchiveDB, rebuild_target_from_disk
 from .doctor import run_environment_checks
 from .downloader import SyncEngine, build_run_report
 from .platform import Platform
@@ -21,9 +24,15 @@ from .state import StateStore
 
 app = typer.Typer(
     name="biliyt",
-    help="基于 yt-dlp 的 Bilibili / YouTube 目标用户批量增量下载工作流",
+    help="基于 yt-dlp 的 Bilibili / YouTube 目标用户批量增量下载与归档工作流",
     no_args_is_help=True,
 )
+db_app = typer.Typer(
+    name="db",
+    help="SQLite 归档数据库统计与离线重建工具",
+    no_args_is_help=True,
+)
+app.add_typer(db_app, name="db")
 console = Console()
 
 
@@ -322,6 +331,16 @@ def sync(
     report = build_run_report(mode, started_at, summaries)
     if not dry_run:
         report_path = state.save_report(report)
+        try:
+            with ArchiveDB(state.state_dir / "biliyt.db") as db:
+                db.record_sync_run(
+                    mode=report.mode,
+                    started_at=report.started_at,
+                    finished_at=report.finished_at,
+                    summary_dict=asdict(report),
+                )
+        except Exception:
+            pass
     else:
         report_path = None
 
@@ -431,3 +450,171 @@ def status(
         )
     else:
         console.print("[dim]尚无同步运行记录。[/dim]")
+
+
+def _resolve_state_dir(config: Path) -> tuple[AppConfig, Path, Path]:
+    cfg, base_dir = load_config(config)
+    raw = Path(cfg.paths.state_dir).expanduser()
+    state_dir = raw if raw.is_absolute() else (base_dir / raw).resolve()
+    return cfg, base_dir, state_dir
+
+
+@db_app.command("stats")
+def db_stats(
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="配置文件路径"),
+) -> None:
+    """查看 SQLite 归档数据库体积与各表统计行数。"""
+    try:
+        _, _, state_dir = _resolve_state_dir(config)
+    except Exception as exc:
+        console.print(f"[red]加载配置失败:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    db_path = state_dir / "biliyt.db"
+    if not db_path.exists():
+        console.print(f"[yellow]数据库尚未创建:[/yellow] {db_path}（可运行 `biliyt db rebuild` 从本地文件重建）")
+        return
+
+    with ArchiveDB(db_path) as db:
+        info = db.stats()
+
+    size_kb = info["size_bytes"] / 1024
+    table = Table(title=f"SQLite 归档统计 ({size_kb:.1f} KB)")
+    table.add_column("数据表", style="cyan")
+    table.add_column("记录数", justify="right", style="green")
+
+    labels = {
+        "profiles": "profiles (UP 主档案)",
+        "profile_snapshots": "profile_snapshots (历史快照)",
+        "videos": "videos (视频与字幕)",
+        "dynamics": "dynamics (动态)",
+        "articles": "articles (专栏)",
+        "comments": "comments (精选评论)",
+        "favorites": "favorites (公开收藏夹)",
+        "favorite_items": "favorite_items (收藏视频清单)",
+        "sync_runs": "sync_runs (同步日志)",
+        "search_fts": "search_fts (全文检索索引项)",
+    }
+    for key, label in labels.items():
+        table.add_row(label, str(info["counts"].get(key, 0)))
+
+    console.print(table)
+    console.print(f"[dim]数据库路径: {info['db_path']}[/dim]")
+
+
+@db_app.command("rebuild")
+def db_rebuild(
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="配置文件路径"),
+    target: Optional[list[str]] = typer.Option(None, "--target", "-t", help="仅重建指定 target id（可多次传入）"),
+    reset: bool = typer.Option(False, "--reset", help="先清空现有数据库再从 downloads/ 全量重建"),
+) -> None:
+    """从本地 downloads/ 已有文件无损重建 SQLite 归档与全文索引（零网络请求）。"""
+    try:
+        cfg, base_dir, targets = _load_and_select_targets(
+            config, target_ids=target, include_disabled=True
+        )
+    except Exception as exc:
+        console.print(f"[red]加载配置失败:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    state_dir = (
+        targets[0].state_dir
+        if targets
+        else (base_dir / cfg.paths.state_dir).resolve()
+    )
+    db_path = state_dir / "biliyt.db"
+
+    table = Table(title="SQLite 离线重建汇总")
+    table.add_column("Target", style="cyan", no_wrap=True)
+    table.add_column("档案", justify="right")
+    table.add_column("视频", justify="right", style="green")
+    table.add_column("动态", justify="right", style="green")
+    table.add_column("专栏", justify="right", style="green")
+    table.add_column("收藏夹", justify="right")
+    table.add_column("评论", justify="right", style="green")
+
+    with ArchiveDB(db_path) as db:
+        if reset:
+            db.reset()
+        for t in targets:
+            c = rebuild_target_from_disk(db, t)
+            table.add_row(
+                t.id,
+                str(c["profiles"]),
+                str(c["videos"]),
+                str(c["dynamics"]),
+                str(c["articles"]),
+                str(c["favorites"]),
+                str(c["comments"]),
+            )
+        st = db.stats()
+
+    console.print(table)
+    console.print(
+        f"[dim]数据库: {st['db_path']} ({st['size_bytes'] / 1024:.1f} KB) | "
+        f"全文索引条目: {st['counts'].get('search_fts', 0)}[/dim]"
+    )
+
+
+_VALID_SEARCH_KINDS = {"video", "subtitle", "dynamic", "article", "comment"}
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="检索关键词（支持中文子串与空格分隔多词）"),
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="配置文件路径"),
+    target: Optional[str] = typer.Option(None, "--target", "-t", help="仅搜索指定 target id"),
+    kind: Optional[str] = typer.Option(
+        None,
+        "--kind",
+        "-k",
+        help="按内容类型过滤，逗号分隔（video,subtitle,dynamic,article,comment）",
+    ),
+    limit: int = typer.Option(20, "--limit", "-n", min=1, max=200, help="最多返回条数"),
+) -> None:
+    """在本地 SQLite 归档库中跨视频、字幕、动态、专栏与评论全文检索。"""
+    try:
+        _, _, state_dir = _resolve_state_dir(config)
+    except Exception as exc:
+        console.print(f"[red]加载配置失败:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    kinds: set[str] | None = None
+    if kind and kind.strip():
+        kinds = {p.strip().lower() for p in kind.split(",") if p.strip()}
+        unknown = sorted(kinds - _VALID_SEARCH_KINDS)
+        if unknown:
+            console.print(
+                f"[red]未知类型:[/red] {', '.join(unknown)}（可选: {', '.join(sorted(_VALID_SEARCH_KINDS))}）"
+            )
+            raise typer.Exit(code=1)
+
+    db_path = state_dir / "biliyt.db"
+    if not db_path.exists():
+        console.print(f"[yellow]尚未建立索引数据库:[/yellow] {db_path}，请先运行 `biliyt db rebuild`。")
+        raise typer.Exit(code=1)
+
+    with ArchiveDB(db_path) as db:
+        hits = db.search(query, target_id=target, kinds=kinds, limit=limit)
+
+    if not hits:
+        console.print(f"[yellow]未找到与 {query!r} 匹配的本地归档内容。[/yellow]")
+        return
+
+    table = Table(title=f"本地归档检索结果：{query}（共 {len(hits)} 条）")
+    table.add_column("类型", style="cyan", no_wrap=True)
+    table.add_column("日期", no_wrap=True)
+    table.add_column("标题 / 来源", style="bold")
+    table.add_column("命中片段")
+    table.add_column("链接", style="dim")
+
+    for h in hits:
+        table.add_row(
+            h.kind,
+            h.published_at[:10],
+            rich_escape(h.title),
+            rich_escape(h.snippet),
+            rich_escape(h.source_url),
+        )
+
+    console.print(table)
