@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import yt_dlp
 
+from .bilibili.archiver import BilibiliArchiver, ExtendedProbeSummary
 from .config import ResolvedTarget
 from .options import build_daterange, build_download_opts, build_probe_opts, evaluate_video_filters
 from .platform import Platform
@@ -107,6 +108,7 @@ class SyncEngine:
         state: StateStore,
         *,
         ydl_factory: Callable[[dict[str, Any]], Any] | None = None,
+        bili_archiver: BilibiliArchiver | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -114,19 +116,29 @@ class SyncEngine:
         self._ydl_factory = ydl_factory or yt_dlp.YoutubeDL
         self._on_event = on_event
         self._sleeper = sleeper
+        self.bili_archiver = bili_archiver or BilibiliArchiver(state, on_event=on_event)
 
     def _emit(self, event: str, **payload: Any) -> None:
         if self._on_event:
             self._on_event(event, payload)
+
+    def probe_extended_bilibili(
+        self,
+        target: ResolvedTarget,
+        *,
+        limit_override: int | None = None,
+    ) -> ExtendedProbeSummary:
+        return self.bili_archiver.probe_extended(target, limit_override=limit_override)
 
     def probe_target(
         self,
         target: ResolvedTarget,
         *,
         limit_override: int | None = None,
+        full: bool = False,
     ) -> ProbeResult:
         logger = _CaptureLogger()
-        opts = build_probe_opts(target, limit_override=limit_override, logger=logger)
+        opts = build_probe_opts(target, limit_override=limit_override, full=full, logger=logger)
         result = ProbeResult(target=target)
 
         try:
@@ -308,6 +320,9 @@ class SyncEngine:
         *,
         dry_run: bool = False,
         limit_override: int | None = None,
+        only: set[str] | None = None,
+        full: bool = False,
+        refresh_comments: bool = False,
     ) -> TargetRunSummary:
         summary = TargetRunSummary(
             target_id=target.id,
@@ -317,68 +332,111 @@ class SyncEngine:
             dry_run=dry_run,
         )
 
-        self._emit("probe_start", target=target)
-        probe = self.probe_target(target, limit_override=limit_override)
-        if probe.error:
-            summary.failed += 1
-            summary.errors.append(probe.error)
-            self._emit("target_error", target=target, error=probe.error)
-            return summary
+        run_videos = (
+            ("videos" in only)
+            if only is not None
+            else (target.platform != Platform.BILIBILI or target.archive.videos)
+        )
 
-        summary.discovered = len(probe.entries)
-        summary.already_archived = probe.archived_count
-        summary.filtered_out = probe.filtered_count
-        candidates = probe.pending
-
-        max_dl = target.filters.max_downloads
-        if limit_override is not None and (max_dl is None or limit_override < max_dl):
-            max_dl = limit_override
-
-        self._emit("probe_done", target=target, probe=probe, max_downloads=max_dl)
-
-        if dry_run:
-            return summary
-
-        for idx, item in enumerate(candidates, start=1):
-            if max_dl is not None and summary.downloaded >= max_dl:
-                break
-
-            self._emit(
-                "item_start",
-                target=target,
-                index=idx,
-                total=len(candidates),
-                item=item,
-            )
-            outcome, detail = self._download_single(
-                target,
-                item.url,
-                video_id=item.video_id,
-                title=item.title,
-            )
-            if outcome == "downloaded":
-                summary.downloaded += 1
-            elif outcome == "filtered":
-                summary.filtered_out += 1
-            elif outcome == "archived":
-                summary.already_archived += 1
-            else:
+        if run_videos:
+            self._emit("probe_start", target=target)
+            probe = self.probe_target(target, limit_override=limit_override, full=full)
+            if probe.error:
                 summary.failed += 1
-                summary.errors.append(f"{item.title}: {detail}")
+                summary.errors.append(probe.error)
+                summary.module_stats["videos"] = {
+                    "discovered": 0,
+                    "already_archived": 0,
+                    "saved": 0,
+                    "failed": 1,
+                }
+                self._emit("target_error", target=target, error=probe.error)
+            else:
+                v_discovered = len(probe.entries)
+                v_archived = probe.archived_count
+                v_filtered = probe.filtered_count
+                v_downloaded = 0
+                v_failed = 0
+                candidates = probe.pending
 
-            self._emit(
-                "item_done",
-                target=target,
-                index=idx,
-                total=len(candidates),
-                item=item,
-                outcome=outcome,
-                detail=detail,
+                max_dl = None if full else target.filters.max_downloads
+                if not full and limit_override is not None and (max_dl is None or limit_override < max_dl):
+                    max_dl = limit_override
+
+                self._emit("probe_done", target=target, probe=probe, max_downloads=max_dl)
+
+                if not dry_run:
+                    for idx, item in enumerate(candidates, start=1):
+                        if max_dl is not None and v_downloaded >= max_dl:
+                            break
+
+                        self._emit(
+                            "item_start",
+                            target=target,
+                            index=idx,
+                            total=len(candidates),
+                            item=item,
+                        )
+                        outcome, detail = self._download_single(
+                            target,
+                            item.url,
+                            video_id=item.video_id,
+                            title=item.title,
+                        )
+                        if outcome == "downloaded":
+                            v_downloaded += 1
+                        elif outcome == "filtered":
+                            v_filtered += 1
+                        elif outcome == "archived":
+                            v_archived += 1
+                        else:
+                            v_failed += 1
+                            summary.errors.append(f"{item.title}: {detail}")
+
+                        self._emit(
+                            "item_done",
+                            target=target,
+                            index=idx,
+                            total=len(candidates),
+                            item=item,
+                            outcome=outcome,
+                            detail=detail,
+                        )
+
+                        has_more = idx < len(candidates) and (max_dl is None or v_downloaded < max_dl)
+                        if has_more and outcome in {"downloaded", "failed"}:
+                            self._sleep_between_items(target)
+
+                summary.discovered += v_discovered
+                summary.already_archived += v_archived
+                summary.filtered_out += v_filtered
+                summary.downloaded += v_downloaded
+                summary.failed += v_failed
+                summary.module_stats["videos"] = {
+                    "discovered": v_discovered,
+                    "already_archived": v_archived,
+                    "saved": v_downloaded,
+                    "failed": v_failed,
+                }
+        else:
+            self._emit("probe_start", target=target)
+
+        if target.platform == Platform.BILIBILI:
+            ext_results = self.bili_archiver.sync_all(
+                target,
+                only=only,
+                limit_override=limit_override,
+                full=full,
+                dry_run=dry_run,
+                refresh_comments=refresh_comments,
             )
-
-            has_more = idx < len(candidates) and (max_dl is None or summary.downloaded < max_dl)
-            if has_more and outcome in {"downloaded", "failed"}:
-                self._sleep_between_items(target)
+            for mod_name, mod_stats in ext_results.items():
+                summary.module_stats[mod_name] = mod_stats.to_dict()
+                summary.discovered += mod_stats.discovered
+                summary.already_archived += mod_stats.already_archived
+                summary.downloaded += mod_stats.saved
+                summary.failed += mod_stats.failed
+                summary.errors.extend(mod_stats.errors)
 
         return summary
 
@@ -421,12 +479,15 @@ class SyncEngine:
                     total=len(recs),
                     record=rec,
                 )
-                outcome, detail = self._download_single(
-                    target,
-                    rec.url,
-                    video_id=rec.video_id,
-                    title=rec.title,
-                )
+                if rec.item_type == "video":
+                    outcome, detail = self._download_single(
+                        target,
+                        rec.url,
+                        video_id=rec.video_id,
+                        title=rec.title,
+                    )
+                else:
+                    outcome, detail = self.bili_archiver.retry_failed_item(target, rec)
                 if outcome == "downloaded":
                     summary.downloaded += 1
                 elif outcome == "filtered":

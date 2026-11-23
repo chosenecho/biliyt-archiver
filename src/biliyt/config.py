@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -92,6 +92,49 @@ class RateLimitConfig(BaseModel):
         return self
 
 
+class CommentArchiveConfig(BaseModel):
+    enabled: bool = False
+    targets: list[Literal["videos", "dynamics", "articles"]] = Field(
+        default_factory=lambda: ["videos", "dynamics", "articles"]
+    )
+    strategy: Literal["up_and_top", "off"] = "up_and_top"
+    top_n: int = Field(default=50, ge=0, le=500)
+    include_pinned: bool = True
+    include_up_replies: bool = True
+    max_sub_replies_per_root: int = Field(default=20, ge=0, le=100)
+
+
+class BilibiliArchiveConfig(BaseModel):
+    layout: Literal["flat", "grouped"] = "flat"
+    profile: bool = False
+    videos: bool = True
+    dynamics: bool = False
+    articles: bool = False
+    favorites: bool = False
+    audio: bool = False
+    dynamics_limit: int | None = Field(default=50, ge=1)
+    articles_limit: int | None = Field(default=50, ge=1)
+    download_images: bool = True
+    api_sleep_min: float = Field(default=1.5, ge=0.0)
+    api_sleep_max: float = Field(default=3.5, ge=0.0)
+    comments: CommentArchiveConfig = Field(default_factory=CommentArchiveConfig)
+
+    @model_validator(mode="after")
+    def _validate_api_sleep_bounds(self) -> BilibiliArchiveConfig:
+        if self.api_sleep_max < self.api_sleep_min:
+            self.api_sleep_max = self.api_sleep_min
+        return self
+
+    def any_extended_enabled(self) -> bool:
+        return bool(
+            self.profile
+            or self.dynamics
+            or self.articles
+            or self.favorites
+            or (self.comments.enabled and self.comments.strategy != "off")
+        )
+
+
 class PlatformConfig(BaseModel):
     proxy: str | None = None
     auth: AuthConfig = Field(default_factory=AuthConfig)
@@ -99,6 +142,7 @@ class PlatformConfig(BaseModel):
     impersonate: str | None = None
     js_runtime: str | None = "auto"
     extractor_args: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
+    archive: BilibiliArchiveConfig | None = None
 
     @field_validator("proxy", "impersonate", "js_runtime", mode="before")
     @classmethod
@@ -124,6 +168,7 @@ class TargetConfig(BaseModel):
     impersonate: str | None = None
     js_runtime: str | None = None
     extractor_args: dict[str, dict[str, list[str]]] | None = None
+    archive: BilibiliArchiveConfig | None = None
 
     @field_validator("proxy", "impersonate", "js_runtime", "output_subdir", mode="before")
     @classmethod
@@ -186,6 +231,7 @@ class ResolvedTarget:
     impersonate: str | None
     js_runtime: str | None
     extractor_args: dict[str, dict[str, list[str]]]
+    archive: BilibiliArchiveConfig = field(default_factory=BilibiliArchiveConfig)
 
 
 def _merge_model(base: TModel, override: TModel | None) -> TModel:
@@ -193,6 +239,22 @@ def _merge_model(base: TModel, override: TModel | None) -> TModel:
     if override is None:
         return base.model_copy(deep=True)
     patch = {field: getattr(override, field) for field in override.model_fields_set}
+    return base.model_copy(update=patch, deep=True)
+
+
+def _merge_archive_config(
+    base: BilibiliArchiveConfig,
+    override: BilibiliArchiveConfig | None,
+) -> BilibiliArchiveConfig:
+    """Deep-merge BilibiliArchiveConfig including nested `comments` fields."""
+    if override is None:
+        return base.model_copy(deep=True)
+    patch: dict[str, Any] = {}
+    for fname in override.model_fields_set:
+        if fname == "comments":
+            patch["comments"] = _merge_model(base.comments, override.comments)
+        else:
+            patch[fname] = getattr(override, fname)
     return base.model_copy(update=patch, deep=True)
 
 
@@ -211,6 +273,8 @@ def resolve_target(config: AppConfig, target: TargetConfig, base_dir: Path) -> R
     rate_limit = _merge_model(config.rate_limit, platform_cfg.rate_limit)
     rate_limit = _merge_model(rate_limit, target.rate_limit)
     auth = _merge_model(platform_cfg.auth, target.auth)
+    archive = _merge_archive_config(BilibiliArchiveConfig(), platform_cfg.archive)
+    archive = _merge_archive_config(archive, target.archive)
 
     if auth.cookies_file:
         auth = auth.model_copy(update={"cookies_file": str(_resolve_path(auth.cookies_file, base_dir))})
@@ -257,6 +321,7 @@ def resolve_target(config: AppConfig, target: TargetConfig, base_dir: Path) -> R
         impersonate=impersonate,
         js_runtime=js_runtime,
         extractor_args=merged_extractor_args,
+        archive=archive,
     )
 
 

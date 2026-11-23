@@ -208,6 +208,7 @@ def build_probe_opts(
     target: ResolvedTarget,
     *,
     limit_override: int | None = None,
+    full: bool = False,
     logger: Any | None = None,
 ) -> dict[str, Any]:
     """Build lightweight yt-dlp options for flat listing / probing target feeds."""
@@ -221,9 +222,10 @@ def build_probe_opts(
     if logger is not None:
         opts["logger"] = logger
 
-    effective_limit = limit_override if limit_override is not None else target.filters.recent_limit
-    if effective_limit is not None:
-        opts["playlistend"] = effective_limit
+    if not full:
+        effective_limit = limit_override if limit_override is not None else target.filters.recent_limit
+        if effective_limit is not None:
+            opts["playlistend"] = effective_limit
 
     _apply_common_network_and_auth(opts, target)
     return opts
@@ -305,11 +307,17 @@ def build_download_opts(
     if target.platform == Platform.BILIBILI and media.write_danmaku and "danmaku" not in subtitle_langs:
         subtitle_langs.append("danmaku")
 
+    video_home_dir = (
+        target.download_dir / "videos"
+        if target.platform == Platform.BILIBILI and target.archive.layout == "grouped"
+        else target.download_dir
+    )
+
     opts: dict[str, Any] = {
         "format": fmt,
         "format_sort": sort_order,
         "merge_output_format": media.container,
-        "paths": {"home": str(target.download_dir)},
+        "paths": {"home": str(video_home_dir)},
         "outtmpl": {"default": target.filename_template},
         "windowsfilenames": True,
         "nooverwrites": True,

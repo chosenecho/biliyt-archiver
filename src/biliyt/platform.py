@@ -15,7 +15,24 @@ class Platform(str, Enum):
 _YOUTUBE_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 _YOUTUBE_HANDLE_RE = re.compile(r"^@[A-Za-z0-9._-]{2,}$")
 _BILIBILI_UID_RE = re.compile(r"^(?:(?:uid|bili):)?(\d{1,20})$", re.IGNORECASE)
+_BILIBILI_SPACE_UID_RE = re.compile(r"^/(\d{1,20})(?:/|$)")
 _YOUTUBE_TAB_PATHS = {"videos", "shorts", "streams", "playlists", "releases", "featured", "community"}
+
+
+def extract_bilibili_uid(source: str) -> int | None:
+    """Extract numeric Bilibili UID (mid) from a bare UID or space.bilibili.com URL."""
+    cleaned = source.strip()
+    m = _BILIBILI_UID_RE.match(cleaned)
+    if m:
+        return int(m.group(1))
+
+    candidate = cleaned if cleaned.startswith(("http://", "https://")) else f"https://{cleaned}"
+    parsed = urlparse(candidate)
+    if parsed.netloc.lower() == "space.bilibili.com":
+        pm = _BILIBILI_SPACE_UID_RE.match(parsed.path)
+        if pm:
+            return int(pm.group(1))
+    return None
 
 
 def detect_platform(source: str) -> Platform:

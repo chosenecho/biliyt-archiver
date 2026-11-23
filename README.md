@@ -8,6 +8,7 @@
 - **两阶段增量引擎**：先轻量探查目标投稿列表并比对本地归档（`state/archives/<id>.txt`），跳过已下载与不符合筛选条件的视频，再逐条下载，大幅降低平台风控风险。
 - **精细范围过滤**：支持最近 N 条（`recent_limit`）、单次上限（`max_downloads`）、日期区间（支持 `now-30days`）、时长区间、播放量门槛、标题/标签关键词白黑名单、跳过直播与 YouTube Shorts。
 - **完整素材输出**：自动混流为 MP4（可限最高分辨率与编码偏好），同步保存 `.info.json` 元数据、封面图（默认转 `.jpg`）、字幕（B 站 CC / YouTube 人工与自动字幕，默认转 `.srt`），并可选 B 站 XML 弹幕与 YouTube SponsorBlock 去广告。
+- **B 站 UP 主全量内容归档**：除投稿视频外，支持内置 WBI 签名与风控熔断的 Web API 归档——涵盖 **主页档案与合集、动态（含转发与本地原图）、专栏（兼容旧 `cv` 与新版 Opus）、公开收藏夹清单（仅元数据不下载他人视频）、精选评论（置顶 + UP 主回复 + 热门前 N 条）**，全部采用 Markdown + 原始 JSON 双存。
 - **分平台网络与鉴权**：支持 YouTube 走本地 HTTP/SOCKS 代理 + B 站直连；支持浏览器直读 Cookie 与 `cookies.txt` 文件。
 - **YouTube EJS 自动适配**：自动检测本机 `deno` 或 `node`（Node 20+）并注入 `js_runtimes`，开箱兼容新版 yt-dlp YouTube 解析。
 - **失败队列与断点重试**：单条下载失败自动写入 `state/failed.jsonl`，随时通过 `--retry-failed` 精准补下。
@@ -94,8 +95,8 @@ uv sync --python-preference only-system --python 3.12
 | `biliyt init` | 复制生成 `config.yaml` 与 `cookies/` 目录 | `-c/--config`, `-f/--force` |
 | `biliyt check` | 检查 Python/yt-dlp/FFmpeg/JS Runtime/配置/代理/Cookie | `-c/--config` |
 | `biliyt probe` | 轻量拉取列表并统计已归档/跳过/待下载数量 | `-t/--target`, `-p/--platform`, `-n/--limit`, `--show` |
-| `biliyt sync` | 执行增量下载或失败重试，并写入 JSON 运行报告 | `-t/--target`, `-p/--platform`, `-n/--limit`, `--dry-run`, `--retry-failed` |
-| `biliyt status` | 展示各目标累计归档、待重试失败数与上次运行摘要 | `-c/--config` |
+| `biliyt sync` | 执行增量下载、B 站全量扩展归档或失败重试，并写入 JSON 运行报告 | `-t/--target`, `-p/--platform`, `-n/--limit`, `--only`, `--full`, `--refresh-comments`, `--dry-run`, `--retry-failed` |
+| `biliyt status` | 展示各目标累计归档（视频/动态/专栏/评论）、待重试失败数与上次运行摘要 | `-c/--config` |
 
 ## 接入 Windows 定时任务
 
@@ -115,3 +116,5 @@ python -m pytest -v
 
 - [配置详解（docs/configuration.md）](docs/configuration.md)
 - [常见问题与运维排查（docs/troubleshooting.md）](docs/troubleshooting.md)
+- [B 站全量内容归档 PDR（docs/bilibili-full-archive-pdr.md）](docs/bilibili-full-archive-pdr.md)
+- [B 站全量内容归档 SOP（docs/bilibili-full-archive-sop.md）](docs/bilibili-full-archive-sop.md)

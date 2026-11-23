@@ -190,3 +190,41 @@ targets:
 | `platform` | 否 | `bilibili` 或 `youtube`，省略时按 `source` 自动识别。 |
 | `enabled` | 否 | 默认 `true`；设为 `false` 时默认跳过（仅在 `--target <id>` 显式指定时执行）。 |
 | `youtube_tab` | 否 | 仅对 YouTube 频道根路径生效，默认 `videos`，避免混入 Shorts 与直播回放；若要按原样抓取整频道填 `raw`。 |
+| `archive` | 否 | B 站扩展内容归档配置（覆盖 `platforms.bilibili.archive`），详见第 7 节。 |
+
+---
+
+## 7. `platforms.bilibili.archive`：B 站全量内容归档
+
+支持在 `platforms.bilibili.archive`（全局默认）或单目标 `targets[].archive` 中开启 B 站非视频内容归档：
+
+```yaml
+platforms:
+  bilibili:
+    archive:
+      layout: "flat"           # flat: 视频保持根目录，扩展内容放子目录；grouped: 视频归入 videos/
+      profile: true            # 主页档案、头像、横幅、公开合集目录
+      videos: true             # 投稿视频（yt-dlp）
+      dynamics: true           # 动态（Markdown + 本地原图 + 原始 JSON）
+      articles: true           # 专栏（兼容旧 cv HTML 与新版 Opus）
+      favorites: true          # 公开收藏夹清单（仅存 JSON + MD 列表，不下载他人视频）
+      dynamics_limit: 50       # 增量模式下每次最多检查动态数（--full 忽略）
+      articles_limit: 50       # 增量模式下每次最多检查专栏数（--full 忽略）
+      download_images: true    # 是否将动态与专栏图片本地化
+      api_sleep_min: 1.5       # B 站 Web API 请求最小随机间隔（秒）
+      api_sleep_max: 3.5       # B 站 Web API 请求最大随机间隔（秒）
+      comments:
+        enabled: true
+        targets: ["videos", "dynamics", "articles"]
+        strategy: "up_and_top" # 置顶评论 + UP 主回复 + 热门前 N 条
+        top_n: 50
+        include_pinned: true
+        include_up_replies: true
+        max_sub_replies_per_root: 20
+```
+
+配合 `biliyt sync` 可按模块精准执行：
+- `biliyt sync --only profile,favorites`
+- `biliyt sync --only dynamics,articles --limit 10`
+- `biliyt sync --only comments --refresh-comments`
+- `biliyt sync --full`（全量回溯历史）

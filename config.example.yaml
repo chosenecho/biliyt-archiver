@@ -93,6 +93,29 @@ platforms:
       max_sleep_interval: 10.0
       sleep_requests: 1.5
       concurrent_fragments: 4
+    # B 站扩展内容全量归档（主页档案 / 动态 / 专栏 / 公开收藏夹清单 / 精选评论）
+    archive:
+      # flat: 视频保持在目标根目录，扩展内容存放在子目录（兼容已有目录）
+      # grouped: 视频额外归入 videos/ 子目录
+      layout: "flat"
+      profile: false
+      videos: true
+      dynamics: false
+      articles: false
+      favorites: false         # 仅存收藏夹视频清单（JSON + MD），不下载他人视频
+      dynamics_limit: 50
+      articles_limit: 50
+      download_images: true
+      api_sleep_min: 1.5
+      api_sleep_max: 3.5
+      comments:
+        enabled: false
+        targets: ["videos", "dynamics", "articles"]
+        strategy: "up_and_top" # 置顶 + UP 主回复 + 热门前 N 条
+        top_n: 50
+        include_pinned: true
+        include_up_replies: true
+        max_sub_replies_per_root: 20
 
   youtube:
     # YouTube 按需配置本地 HTTP / SOCKS5 代理，例如 "http://127.0.0.1:7890"

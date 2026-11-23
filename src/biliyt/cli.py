@@ -181,7 +181,34 @@ def probe(
                 )
             console.print(detail_table)
 
+        if t.platform == Platform.BILIBILI and t.archive.any_extended_enabled():
+            ext = engine.probe_extended_bilibili(t, limit_override=limit)
+            if ext.error:
+                console.print(f"    [yellow]扩展内容探查提示:[/yellow] {ext.error}")
+            else:
+                console.print(
+                    f"    [cyan]B 站扩展探查[/cyan] (UID={ext.uid}): "
+                    f"动态抽样 {ext.dynamics_sampled} (待归档 {ext.dynamics_pending}) | "
+                    f"专栏总计 {ext.articles_total} (首页待归档 {ext.articles_pending}) | "
+                    f"公开收藏夹 {ext.favorites_folders} 个"
+                )
+
     console.print(summary_table)
+
+
+_VALID_ONLY_MODULES = {"profile", "videos", "dynamics", "articles", "favorites", "comments"}
+
+
+def _parse_only_modules(raw: str | None) -> set[str] | None:
+    if not raw or not raw.strip():
+        return None
+    mods = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    unknown = sorted(mods - _VALID_ONLY_MODULES)
+    if unknown:
+        raise typer.BadParameter(
+            f"未知模块: {', '.join(unknown)}。可选值: {', '.join(sorted(_VALID_ONLY_MODULES))}"
+        )
+    return mods
 
 
 @app.command()
@@ -190,11 +217,19 @@ def sync(
     target: Optional[list[str]] = typer.Option(None, "--target", "-t", help="仅同步指定 target id（可多次传入）"),
     platform: Optional[Platform] = typer.Option(None, "--platform", "-p", help="仅同步指定平台"),
     limit: Optional[int] = typer.Option(None, "--limit", "-n", min=1, help="限制每个目标本次最多检查/下载数量"),
+    only: Optional[str] = typer.Option(
+        None,
+        "--only",
+        help="仅运行指定模块，逗号分隔（profile,videos,dynamics,articles,favorites,comments）",
+    ),
+    full: bool = typer.Option(False, "--full", help="全量回溯模式：忽略数量上限与动态增量早停"),
+    refresh_comments: bool = typer.Option(False, "--refresh-comments", help="强制刷新已归档条目的精选评论"),
     dry_run: bool = typer.Option(False, "--dry-run", help="演练模式：只列出将要下载的条目，不实际下载"),
     retry_failed: bool = typer.Option(False, "--retry-failed", help="仅重试 state/failed.jsonl 中的历史失败条目"),
 ) -> None:
-    """增量同步目标用户视频（支持 dry-run 与历史失败重试）。"""
+    """增量同步目标用户视频与 B 站全量内容（支持 dry-run、分模块与历史失败重试）。"""
     try:
+        only_modules = _parse_only_modules(only)
         cfg, base_dir, targets = _load_and_select_targets(
             config, target, platform, include_disabled=retry_failed and bool(target)
         )
@@ -249,6 +284,16 @@ def sync(
                 console.print(f"      [red]✗ 重试仍失败: {payload['detail']}[/red]")
         elif event == "target_error":
             console.print(f"    [red]✗ 目标解析失败: {payload['error']}[/red]")
+        elif event == "ext_module_start":
+            console.print(f"    [cyan]• 同步模块 \\[{payload['module']}][/cyan] ...")
+        elif event == "ext_module_done":
+            st = payload["stats"]
+            console.print(
+                f"      发现 {st.discovered} | 已归档 {st.already_archived} | "
+                f"新增 [green]{st.saved}[/green] | 失败 [red]{st.failed}[/red]"
+            )
+            for err in st.errors[:3]:
+                console.print(f"      [red]! {err}[/red]")
 
     engine = SyncEngine(state, on_event=_on_event)
 
@@ -262,7 +307,15 @@ def sync(
         mode = "retry_failed_dry_run" if dry_run else "retry_failed"
     else:
         summaries = [
-            engine.sync_target(t, dry_run=dry_run, limit_override=limit) for t in targets
+            engine.sync_target(
+                t,
+                dry_run=dry_run,
+                limit_override=limit,
+                only=only_modules,
+                full=full,
+                refresh_comments=refresh_comments,
+            )
+            for t in targets
         ]
         mode = "sync_dry_run" if dry_run else "sync"
 
@@ -296,6 +349,28 @@ def sync(
 
     console.print()
     console.print(table)
+
+    has_module_breakdown = any(len(s.module_stats) > 1 or (s.module_stats and "videos" not in s.module_stats) for s in summaries)
+    if has_module_breakdown:
+        mod_table = Table(title="分模块同步明细")
+        mod_table.add_column("Target", style="cyan")
+        mod_table.add_column("模块")
+        mod_table.add_column("发现", justify="right")
+        mod_table.add_column("已归档", justify="right", style="dim")
+        mod_table.add_column("新增保存", justify="right", style="green")
+        mod_table.add_column("失败", justify="right", style="red")
+        for s in summaries:
+            for mod_name, ms in s.module_stats.items():
+                mod_table.add_row(
+                    s.target_id,
+                    mod_name,
+                    str(ms.get("discovered", 0)),
+                    str(ms.get("already_archived", 0)),
+                    str(ms.get("saved", 0)),
+                    str(ms.get("failed", 0)),
+                )
+        console.print(mod_table)
+
     if report_path:
         console.print(f"[dim]运行报告已保存: {report_path}[/dim]")
     if total_failed > 0:
@@ -322,21 +397,26 @@ def status(
     state = StateStore(state_dir)
 
     table = Table(title="工作流状态总览")
-    table.add_column("Target", style="cyan")
-    table.add_column("平台")
-    table.add_column("启用")
-    table.add_column("累计归档", justify="right", style="green")
-    table.add_column("待重试失败", justify="right", style="red")
+    table.add_column("Target", style="cyan", no_wrap=True)
+    table.add_column("平台", no_wrap=True)
+    table.add_column("启用", no_wrap=True)
+    table.add_column("视频", justify="right", style="green", no_wrap=True)
+    table.add_column("动/专/评", justify="right", style="green", no_wrap=True)
+    table.add_column("失败", justify="right", style="red", no_wrap=True)
     table.add_column("输出目录", style="dim")
 
     for t in targets:
         archived_n = len(state.read_archive_entries(t.id))
+        dyn_n = state.count_namespace_archive(t.id, "dynamics")
+        art_n = state.count_namespace_archive(t.id, "articles")
+        cmt_n = state.count_namespace_archive(t.id, "comments")
         failed_n = len(state.load_failed(t.id))
         table.add_row(
             t.id,
             t.platform.value,
             "是" if t.enabled else "[dim]否[/dim]",
             str(archived_n),
+            f"{dyn_n}/{art_n}/{cmt_n}",
             str(failed_n),
             str(t.download_dir),
         )
