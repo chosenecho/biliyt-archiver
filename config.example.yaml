@@ -1,0 +1,136 @@
+# biliyt 配置文件示例
+# 运行 `uv run biliyt init` 会复制此模板为 `config.yaml`
+
+paths:
+  # 下载输出根目录（各目标默认存放在 <download_dir>/<platform>/<target_id>/）
+  download_dir: "./downloads"
+  # 归档记录、失败队列与运行报告目录
+  state_dir: "./state"
+  # 文件命名模板（使用 yt-dlp 模板语法）
+  filename_template: "%(upload_date>%Y-%m-%d|unknown)s - %(title).120B [%(id)s].%(ext)s"
+
+media:
+  # 分辨率上限：1080 / 2160 / null（null 表示不限画质）
+  max_height: 1080
+  # 自动混流目标容器：mp4 | mkv | webm
+  container: "mp4"
+  # 编码偏好：auto | avc | hevc | av1（mp4 通用兼容可设 avc）
+  prefer_codec: "auto"
+  # 是否保存完整元数据 JSON（标题、简介、标签、上传时间等）
+  write_info_json: true
+  # 是否保存封面图
+  write_thumbnail: true
+  # 封面转换格式：jpg | png | webp | none
+  convert_thumbnail: "jpg"
+  # 是否将元信息与章节写入视频文件
+  embed_metadata: true
+  embed_chapters: true
+  embed_thumbnail: false
+  # 字幕设置
+  write_subtitles: true
+  write_auto_subtitles: true
+  subtitle_langs:
+    - "zh-Hans"
+    - "zh-CN"
+    - "zh-Hant"
+    - "zh"
+    - "en"
+    - "en-US"
+    - "ai-zh"
+  subtitle_format: "srt"
+  embed_subtitles: false
+  # B 站 XML 弹幕开关（按需设为 true）
+  write_danmaku: false
+  # YouTube SponsorBlock 自动剪除片段（如 ["sponsor", "selfpromo"]，留空关闭）
+  sponsorblock_remove: []
+
+filters:
+  # 每次最多检查目标最新 N 条投稿（极大加快增量同步速度；null 表示不限）
+  recent_limit: 20
+  # 单次同步每个目标最多新下载 N 条（null 表示不限）
+  max_downloads: null
+  # 日期区间：支持 YYYYMMDD 或相对时间（如 now-30days）
+  date_after: null
+  date_before: null
+  # 时长区间（单位：秒）
+  min_duration: null
+  max_duration: null
+  # 标题/标签关键词过滤（不区分大小写）
+  include_keywords: []
+  exclude_keywords: []
+  # 默认跳过正在直播与未开播预告
+  skip_live: true
+  # 是否跳过 YouTube Shorts
+  skip_shorts: false
+  # 最低播放量门槛（null 表示不限）
+  min_views: null
+
+rate_limit:
+  # 防风控：每个视频下载间随机休眠 [sleep_interval, max_sleep_interval] 秒
+  sleep_interval: 3.0
+  max_sleep_interval: 8.0
+  # 接口请求间隔（秒）
+  sleep_requests: 1.0
+  # 单视频分片并发数
+  concurrent_fragments: 4
+  # 失败重试次数
+  retries: 5
+  # 限速，如 "5M" / "500K"，null 表示不限速
+  rate_limit: null
+
+platforms:
+  bilibili:
+    # B 站通常直连，留空即可
+    proxy: null
+    auth:
+      # 方式 1：直接读本地浏览器 Cookie（chrome / edge / firefox，支持 "chrome:Default"）
+      # 注意：Windows 下若浏览器正在运行可能锁库，此时建议改用 cookies_file
+      cookies_from_browser: null
+      # 方式 2：Netscape 格式 cookies.txt（推荐，稳定不受浏览器锁文件影响）
+      cookies_file: null
+    rate_limit:
+      sleep_interval: 4.0
+      max_sleep_interval: 10.0
+      sleep_requests: 1.5
+      concurrent_fragments: 4
+
+  youtube:
+    # YouTube 按需配置本地 HTTP / SOCKS5 代理，例如 "http://127.0.0.1:7890"
+    proxy: null
+    # 自动检测 deno 或 node（Node 20+）；也可显式指定 "deno" / "node" / "none"
+    js_runtime: "auto"
+    auth:
+      cookies_from_browser: null
+      cookies_file: null
+    rate_limit:
+      sleep_interval: 2.0
+      max_sleep_interval: 6.0
+      sleep_requests: 1.0
+      concurrent_fragments: 4
+
+# 目标用户列表（以下为示例，默认 enabled: false，填入你的目标并改为 true 即可）
+targets:
+  - id: "bili_example"
+    name: "示例 B 站 UP 主"
+    platform: "bilibili"
+    # 支持纯 UID、空间 URL、合集 URL、收藏夹 URL
+    source: "946974"
+    enabled: false
+    filters:
+      recent_limit: 10
+      date_after: "now-30days"
+      min_duration: 60
+
+  - id: "yt_example"
+    name: "示例 YouTube 频道"
+    platform: "youtube"
+    # 支持 @handle、UC 频道 ID、频道主页 URL、播放列表 URL
+    source: "@mkbhd"
+    youtube_tab: "videos"
+    enabled: false
+    media:
+      max_height: 2160
+    filters:
+      recent_limit: 10
+      exclude_keywords:
+        - "shorts"
