@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+class SyncLockError(RuntimeError):
+    """Raised when another biliyt sync process already holds the state lock."""
 
 
 def _utc_now_iso() -> str:
@@ -60,11 +68,63 @@ class StateStore:
         self.reports_dir = state_dir / "reports"
         self.failed_file = state_dir / "failed.jsonl"
         self.last_run_file = state_dir / "last_run.json"
+        self.lock_file = state_dir / ".sync.lock"
         self._lock = threading.RLock()
 
     def ensure_dirs(self) -> None:
         self.archives_dir.mkdir(parents=True, exist_ok=True)
         self.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def acquire_sync_lock(self) -> Iterator[Path]:
+        """Acquire a non-blocking cross-platform process lock on `state/.sync.lock`."""
+        self.ensure_dirs()
+        fh = self.lock_file.open("a+b")
+        locked = False
+        try:
+            fh.seek(0)
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError as exc:
+                holder = ""
+                try:
+                    fh.seek(0)
+                    holder = fh.read(256).decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    holder = ""
+                detail = f" ({holder})" if holder else ""
+                raise SyncLockError(
+                    f"检测到另一个 biliyt sync 进程正在运行{detail}，请等待其结束后再试。"
+                ) from exc
+
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} started_at={_utc_now_iso()}\n".encode("utf-8"))
+            fh.flush()
+            yield self.lock_file
+        finally:
+            if locked:
+                try:
+                    fh.seek(0)
+                    if sys.platform == "win32":
+                        import msvcrt
+
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            fh.close()
 
     def archive_path(self, target_id: str) -> Path:
         self.ensure_dirs()
@@ -82,6 +142,23 @@ class StateStore:
                     entries.add(stripped)
             return entries
 
+    def append_archive_entries(self, target_id: str, entries: Iterable[str]) -> list[str]:
+        """Thread-safely append deduplicated `<extractor> <id>` entries to the target archive."""
+        with self._lock:
+            existing = self.read_archive_entries(target_id)
+            added: list[str] = []
+            for raw in entries:
+                stripped = raw.strip()
+                if stripped and stripped not in existing:
+                    existing.add(stripped)
+                    added.append(stripped)
+            if added:
+                path = self.archive_path(target_id)
+                with path.open("a", encoding="utf-8") as fh:
+                    for line in added:
+                        fh.write(f"{line}\n")
+            return added
+
     def read_archive_video_ids(self, target_id: str) -> set[str]:
         """Return bare video IDs extracted from '<extractor> <id>' lines."""
         ids: set[str] = set()
@@ -97,18 +174,26 @@ class StateStore:
         self.ensure_dirs()
         return self.archives_dir / f"{target_id}.{namespace}.txt"
 
+    def read_namespace_archive_meta(self, target_id: str, namespace: str) -> dict[str, str]:
+        """Return `{key: meta}` map from '<target_id>.<namespace>.txt'."""
+        with self._lock:
+            path = self.archives_dir / f"{target_id}.{namespace}.txt"
+            if not path.exists():
+                return {}
+            result: dict[str, str] = {}
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                parts = stripped.split(maxsplit=1)
+                key = parts[0]
+                meta = parts[1].strip() if len(parts) == 2 else ""
+                result[key] = meta
+            return result
+
     def read_namespace_archive(self, target_id: str, namespace: str) -> set[str]:
         """Return archived keys from '<target_id>.<namespace>.txt' (first whitespace token per line)."""
-        path = self.archives_dir / f"{target_id}.{namespace}.txt"
-        if not path.exists():
-            return set()
-        keys: set[str] = set()
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            keys.add(stripped.split(maxsplit=1)[0])
-        return keys
+        return set(self.read_namespace_archive_meta(target_id, namespace).keys())
 
     def append_namespace_archive(
         self,
@@ -117,15 +202,25 @@ class StateStore:
         key: str,
         *,
         meta: str = "",
+        update_meta: bool = False,
     ) -> None:
-        """Append a single archived key if not already present."""
-        existing = self.read_namespace_archive(target_id, namespace)
-        if key in existing:
-            return
-        path = self.namespace_archive_path(target_id, namespace)
-        line = f"{key} {meta}".strip() if meta else key
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(f"{line}\n")
+        """Append a single archived key if absent, or update its metadata when `update_meta=True`."""
+        with self._lock:
+            existing = self.read_namespace_archive_meta(target_id, namespace)
+            clean_meta = meta.strip()
+            if key in existing:
+                if not update_meta or existing[key] == clean_meta:
+                    return
+                existing[key] = clean_meta
+                path = self.namespace_archive_path(target_id, namespace)
+                lines = [f"{k} {v}".strip() if v else k for k, v in existing.items()]
+                path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+                return
+
+            path = self.namespace_archive_path(target_id, namespace)
+            line = f"{key} {clean_meta}".strip() if clean_meta else key
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(f"{line}\n")
 
     def count_namespace_archive(self, target_id: str, namespace: str) -> int:
         return len(self.read_namespace_archive(target_id, namespace))

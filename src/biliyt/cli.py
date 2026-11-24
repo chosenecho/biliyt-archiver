@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
+from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,7 +22,7 @@ from .db import ArchiveDB, rebuild_target_from_disk
 from .doctor import run_environment_checks
 from .downloader import SyncEngine, build_run_report
 from .platform import Platform
-from .state import StateStore
+from .state import StateStore, SyncLockError
 
 app = typer.Typer(
     name="biliyt",
@@ -80,12 +82,16 @@ def init(
         Path(__file__).resolve().parents[2] / "config.example.yaml",
     ]
     template = next((p for p in template_candidates if p.exists()), None)
-    if template is None:
+    bundled_template = importlib_resources.files("biliyt").joinpath("config.example.yaml")
+    if template is None and not bundled_template.is_file():
         console.print("[red]未找到模板文件 config.example.yaml[/red]")
         raise typer.Exit(code=1)
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(template, target_path)
+    if template is not None:
+        shutil.copyfile(template, target_path)
+    else:
+        target_path.write_text(bundled_template.read_text(encoding="utf-8"), encoding="utf-8")
     (target_path.parent / "cookies").mkdir(exist_ok=True)
 
     console.print(
@@ -225,13 +231,13 @@ def sync(
     config: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="配置文件路径"),
     target: Optional[list[str]] = typer.Option(None, "--target", "-t", help="仅同步指定 target id（可多次传入）"),
     platform: Optional[Platform] = typer.Option(None, "--platform", "-p", help="仅同步指定平台"),
-    limit: Optional[int] = typer.Option(None, "--limit", "-n", min=1, help="限制每个目标本次最多检查/下载数量"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", min=1, help="限制每个目标本次最多新下载/新保存数量（可与 --full 联用分批回溯历史）"),
     only: Optional[str] = typer.Option(
         None,
         "--only",
         help="仅运行指定模块，逗号分隔（profile,videos,dynamics,articles,favorites,comments）",
     ),
-    full: bool = typer.Option(False, "--full", help="全量回溯模式：忽略数量上限与动态增量早停"),
+    full: bool = typer.Option(False, "--full", help="全量回溯模式：忽略扫描上限与增量早停（可配合 --limit 分批补齐）"),
     refresh_comments: bool = typer.Option(False, "--refresh-comments", help="强制刷新已归档条目的精选评论"),
     dry_run: bool = typer.Option(False, "--dry-run", help="演练模式：只列出将要下载的条目，不实际下载"),
     retry_failed: bool = typer.Option(False, "--retry-failed", help="仅重试 state/failed.jsonl 中的历史失败条目"),
@@ -259,8 +265,9 @@ def sync(
             console.print(f"\n[bold cyan]>>> [{t.platform.value}] {t.name}[/bold cyan] ({t.url})")
         elif event == "probe_done":
             probe_res = payload["probe"]
+            stop_tag = " [dim](增量早停)[/dim]" if getattr(probe_res, "early_stopped", False) else ""
             console.print(
-                f"    发现 {len(probe_res.entries)} 条 | 已归档 {probe_res.archived_count} | "
+                f"    发现 {len(probe_res.entries)} 条{stop_tag} | 已归档 {probe_res.archived_count} | "
                 f"过滤跳过 {probe_res.filtered_count} | 待下载 [green]{len(probe_res.pending)}[/green]"
             )
             if dry_run and probe_res.pending:
@@ -271,6 +278,8 @@ def sync(
             console.print(
                 f"    [{payload['index']}/{payload['total']}] 下载: [bold]{item.title}[/bold]"
             )
+        elif event == "item_warning":
+            console.print(f"      [yellow]! {rich_escape(str(payload['message']))}[/yellow]")
         elif event == "item_done":
             outcome = payload["outcome"]
             detail = payload["detail"]
@@ -308,43 +317,49 @@ def sync(
 
     engine = SyncEngine(state, on_event=_on_event)
 
-    if retry_failed:
-        targets_by_id = {t.id: t for t in targets}
-        summaries = engine.retry_failed(
-            targets_by_id,
-            target_ids=set(target) if target else None,
-            dry_run=dry_run,
-        )
-        mode = "retry_failed_dry_run" if dry_run else "retry_failed"
-    else:
-        summaries = [
-            engine.sync_target(
-                t,
-                dry_run=dry_run,
-                limit_override=limit,
-                only=only_modules,
-                full=full,
-                refresh_comments=refresh_comments,
-            )
-            for t in targets
-        ]
-        mode = "sync_dry_run" if dry_run else "sync"
-
-    report = build_run_report(mode, started_at, summaries)
-    if not dry_run:
-        report_path = state.save_report(report)
-        try:
-            with ArchiveDB(state.state_dir / "biliyt.db") as db:
-                db.record_sync_run(
-                    mode=report.mode,
-                    started_at=report.started_at,
-                    finished_at=report.finished_at,
-                    summary_dict=asdict(report),
+    lock_ctx = nullcontext() if dry_run else state.acquire_sync_lock()
+    try:
+        with lock_ctx:
+            if retry_failed:
+                targets_by_id = {t.id: t for t in targets}
+                summaries = engine.retry_failed(
+                    targets_by_id,
+                    target_ids=set(target) if target else None,
+                    dry_run=dry_run,
                 )
-        except Exception:
-            pass
-    else:
-        report_path = None
+                mode = "retry_failed_dry_run" if dry_run else "retry_failed"
+            else:
+                summaries = [
+                    engine.sync_target(
+                        t,
+                        dry_run=dry_run,
+                        limit_override=limit,
+                        only=only_modules,
+                        full=full,
+                        refresh_comments=refresh_comments,
+                    )
+                    for t in targets
+                ]
+                mode = "sync_dry_run" if dry_run else "sync"
+
+            report = build_run_report(mode, started_at, summaries)
+            if not dry_run:
+                report_path = state.save_report(report)
+                try:
+                    with ArchiveDB(state.state_dir / "biliyt.db") as db:
+                        db.record_sync_run(
+                            mode=report.mode,
+                            started_at=report.started_at,
+                            finished_at=report.finished_at,
+                            summary_dict=asdict(report),
+                        )
+                except Exception:
+                    pass
+            else:
+                report_path = None
+    except SyncLockError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        raise typer.Exit(code=3)
 
     table = Table(title="本次同步汇总" + ("（Dry-Run）" if dry_run else ""))
     table.add_column("Target", style="cyan")

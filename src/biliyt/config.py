@@ -52,6 +52,7 @@ class MediaConfig(BaseModel):
 class FilterConfig(BaseModel):
     recent_limit: int | None = Field(default=None, ge=1)
     max_downloads: int | None = Field(default=None, ge=1)
+    early_stop_after: int | None = Field(default=3, ge=1)
     date_after: str | None = None
     date_before: str | None = None
     min_duration: int | None = Field(default=None, ge=0)
@@ -111,6 +112,7 @@ class CommentArchiveConfig(BaseModel):
     include_pinned: bool = True
     include_up_replies: bool = True
     max_sub_replies_per_root: int = Field(default=20, ge=0, le=100)
+    refresh_recent_days: int = Field(default=0, ge=0, le=365)
 
 
 class BilibiliArchiveConfig(BaseModel):

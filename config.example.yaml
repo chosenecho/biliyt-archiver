@@ -6,6 +6,8 @@ paths:
   download_dir: "./downloads"
   # 归档记录、失败队列与运行报告目录
   state_dir: "./state"
+  # 临时下载/混流目录（null 表示直接在目标目录内暂存；大盘/慢盘可指向本地 SSD 临时目录）
+  temp_dir: null
   # 文件命名模板（使用 yt-dlp 模板语法）
   filename_template: "%(upload_date>%Y-%m-%d|unknown)s - %(title).120B [%(id)s].%(ext)s"
 
@@ -49,6 +51,8 @@ filters:
   recent_limit: 20
   # 单次同步每个目标最多新下载 N 条（null 表示不限）
   max_downloads: null
+  # 增量探查早停阈值：连续遇到 N 条已归档视频即停止继续翻页（--full 忽略；null 关闭）
+  early_stop_after: 3
   # 日期区间：支持 YYYYMMDD 或相对时间（如 now-30days）
   date_after: null
   date_before: null
@@ -73,6 +77,8 @@ rate_limit:
   sleep_requests: 1.0
   # 单视频分片并发数
   concurrent_fragments: 4
+  # 目标内视频并行下载任务数（1-8，默认 1 最稳妥，过高易触发风控）
+  concurrency: 1
   # 失败重试次数
   retries: 5
   # 限速，如 "5M" / "500K"，null 表示不限速
@@ -116,6 +122,8 @@ platforms:
         include_pinned: true
         include_up_replies: true
         max_sub_replies_per_root: 20
+        # 自动增量刷新最近 N 天内发布内容的精选评论（内置 12 小时最小刷新间隔；0 表示关闭）
+        refresh_recent_days: 0
 
   youtube:
     # YouTube 按需配置本地 HTTP / SOCKS5 代理，例如 "http://127.0.0.1:7890"

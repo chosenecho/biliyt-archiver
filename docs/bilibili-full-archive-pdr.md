@@ -1,7 +1,7 @@
 # PDR：B 站 UP 主全量内容离线归档系统（biliyt v0.2）
 
 - **文档状态**：Draft v1.0（待评审确认后进入开发）
-- **所属项目**：`biliyt`（`c:\WorkSpace\bli-youtube`）
+- **所属项目**：`biliyt`（`chosenecho/biliyt-archiver`）
 - **基线版本**：`v0.1.0`（commit `6c469e9`）
 - **适用平台**：Bilibili（保持 YouTube 现有能力与配置 100% 向下兼容）
 
@@ -179,16 +179,16 @@ platforms:
 ## 6. 落盘目录与状态持久化规范
 
 ### 6.1 下载目录结构（`layout: flat` 兼容模式）
-为了不移动已经下载到 `downloads/bilibili/bili_23191782/` 的现有视频文件，默认采用无缝共存目录：
+为了不移动已经下载到 `downloads/bilibili/<target_id>/` 的现有视频文件，默认采用无缝共存目录：
 
 ```text
 downloads/bilibili/<target_id>/
-├── 2026-08-27 - 视频标题 [BV1S8hA6MEvy].mp4          # 现有视频（flat 模式下保持原位）
-├── 2026-08-27 - 视频标题 [BV1S8hA6MEvy].info.json
-├── 2026-08-27 - 视频标题 [BV1S8hA6MEvy].ai-zh.srt
-├── 2026-08-27 - 视频标题 [BV1S8hA6MEvy].jpg
-├── 2026-08-27 - 视频标题 [BV1S8hA6MEvy].comments.json # 视频精选评论（与视频同前缀）
-├── 2026-08-27 - 视频标题 [BV1S8hA6MEvy].comments.md
+├── 2026-08-27 - 视频标题 [BV1xx411c7mD].mp4          # 现有视频（flat 模式下保持原位）
+├── 2026-08-27 - 视频标题 [BV1xx411c7mD].info.json
+├── 2026-08-27 - 视频标题 [BV1xx411c7mD].ai-zh.srt
+├── 2026-08-27 - 视频标题 [BV1xx411c7mD].jpg
+├── 2026-08-27 - 视频标题 [BV1xx411c7mD].comments.json # 视频精选评论（与视频同前缀）
+├── 2026-08-27 - 视频标题 [BV1xx411c7mD].comments.md
 ├── profile/
 │   ├── profile.json
 │   ├── profile.md
@@ -231,9 +231,9 @@ downloads/bilibili/<target_id>/
 ## 7. CLI 交互与运行报告扩展
 
 现有 5 个命令保持不变，在 `probe` / `sync` / `status` 中增加模块维度参数与统计：
-- `biliyt probe --target bili_23191782`：除视频外，同步探查并展示动态、专栏、公开收藏夹的发现数与待归档数。
-- `biliyt sync --target bili_23191782 --only dynamics,articles`：新增可选 `--only`（`profile,videos,dynamics,articles,favorites,comments`），方便分模块增量或首次分批建档。
-- `biliyt sync --target bili_23191782 --full`：全量回溯开关（忽略增量早停与 `*_limit`，翻页到底）。
+- `biliyt probe --target bili_example`：除视频外，同步探查并展示动态、专栏、公开收藏夹的发现数与待归档数。
+- `biliyt sync --target bili_example --only dynamics,articles`：新增可选 `--only`（`profile,videos,dynamics,articles,favorites,comments`），方便分模块增量或首次分批建档。
+- `biliyt sync --target bili_example --full`：全量回溯开关（忽略增量早停与 `*_limit`，翻页到底）。
 - `biliyt status`：展示每个目标下视频 / 动态 / 专栏 / 评论的累计归档数与失败队列数。
 
 ---
@@ -252,13 +252,13 @@ downloads/bilibili/<target_id>/
   - 单测覆盖置顶去重、UP 主回复识别与上限截断。
 - **M4：CLI 集成 + 实测验收 + 文档更新**
   - 接入 `SyncEngine`、`StateStore`、`cli.py` 与运行报告。
-  - 以 `https://space.bilibili.com/23191782` 为实测目标完成端到端验收，更新 `README.md` 与 `docs/configuration.md`。
+  - 以测试 UP 主空间（如 `bili_example`）为实测目标完成端到端验收，更新 `README.md` 与 `docs/configuration.md`。
 
 ### 8.2 验收标准（Definition of Done）
 1. 原有 `pytest` 32 项全部通过，新增单元测试 ≥ 25 项且全绿。
-2. 对目标 `23191782` 执行小批量全模块实测（`--limit 2`）：
+2. 对示例目标执行小批量全模块实测（`--limit 2`）：
    - `profile/`、`dynamics/`、`articles/`、`favorites/` 及视频 `.comments.md`/`.comments.json` 均正确落盘；
    - Markdown 中所有图片均为有效本地相对路径且离线可打开；
    - 收藏夹目录下仅存在 `.json`/`.md` 清单，无第三方视频 `.mp4` 文件。
-3. 立即执行第二次 `biliyt sync --target bili_23191782 --limit 2`，各模块新增下载数均为 `0`（验证增量幂等性）。
+3. 立即执行第二次 `biliyt sync --target bili_example --limit 2`，各模块新增下载数均为 `0`（验证增量幂等性）。
 4. 触发模拟 `-352` 风控错误时，任务按设计休眠重试后安全熔断退出，不丢失已归档状态，且错误项正确记入 `state/failed.jsonl`。

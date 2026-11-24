@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 常见问题与排障指南
+    url: https://github.com/chosenecho/biliyt-archiver/blob/main/docs/troubleshooting.md
+    about: 412/-352 风控、YouTube EJS、Cookie 锁库等常见问题的排查与修复步骤
+  - name: 报告安全漏洞（私密通道）
+    url: https://github.com/chosenecho/biliyt-archiver/security/advisories/new
+    about: 涉及 Cookie 泄露、路径遍历或其他安全风险时，请通过私密安全通道报告

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +15,9 @@ from biliyt.config import (
     TargetConfig,
     resolve_target,
 )
+from biliyt.db import ArchiveDB
 from biliyt.platform import Platform
-from biliyt.state import StateStore
+from biliyt.state import FailedRecord, StateStore
 
 
 class _FakeBilibiliClient:
@@ -351,3 +353,199 @@ def test_archiver_handles_risk_control_gracefully(tmp_path: Path) -> None:
     assert res["profile"].saved == 1
     assert "circuit_breaker" in res
     assert res["circuit_breaker"].failed == 1
+
+
+def test_articles_early_stop_and_full_batch_limit(tmp_path: Path) -> None:
+    target = _make_target(tmp_path)
+    state = StateStore(target.state_dir)
+
+    class _PagedArticlesClient(_FakeBilibiliClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.article_pages_called: list[int] = []
+
+        def get_articles_page(self, uid: int, *, pn: int = 1, ps: int = 30) -> dict[str, Any]:
+            self.article_pages_called.append(pn)
+            all_items = [
+                {
+                    "id": 1000 + i,
+                    "title": f"专栏 {i}",
+                    "author": {"name": "测试UP"},
+                    "publish_time": 1700000000 - i * 100,
+                    "stats": {"view": 100, "like": 10, "reply": 1},
+                }
+                for i in range(4)
+            ]
+            # Simulate 2 items per page even though ps=30 by returning 30-like page boundary or full 2-page mock
+            if pn == 1:
+                return {"count": 32, "articles": all_items[:2] + [{} for _ in range(28)]}
+            return {"count": 32, "articles": all_items[2:]}
+
+    client = _PagedArticlesClient()
+    archiver = BilibiliArchiver(state, client_factory=lambda _: client)
+
+    # Batch 1: --full --limit 2 saves first 2 articles
+    r1 = archiver.sync_all(target, only={"articles"}, full=True, limit_override=2)
+    assert r1["articles"].saved == 2
+    assert state.read_namespace_archive(target.id, "articles") == {"cv1000", "cv1001"}
+
+    # Incremental sync now hits 2 consecutive archived items on page 1 -> early stops before page 2!
+    client.article_pages_called.clear()
+    r_inc = archiver.sync_all(target, only={"articles"}, full=False)
+    assert r_inc["articles"].saved == 0
+    assert client.article_pages_called == [1]
+
+    # Batch 2: --full --limit 2 skips page 1's 2 archived items and saves page 2's 2 items
+    client.article_pages_called.clear()
+    r2 = archiver.sync_all(target, only={"articles"}, full=True, limit_override=2)
+    assert r2["articles"].already_archived == 2
+    assert r2["articles"].saved == 2
+    assert state.read_namespace_archive(target.id, "articles") == {"cv1000", "cv1001", "cv1002", "cv1003"}
+
+
+def test_dynamics_full_batch_limit(tmp_path: Path) -> None:
+    target = _make_target(tmp_path)
+    state = StateStore(target.state_dir)
+    client = _FakeBilibiliClient()
+    archiver = BilibiliArchiver(state, client_factory=lambda _: client)
+
+    # 4 dynamics total across 2 pages -> backfill 2 at a time with full=True, limit_override=2
+    r1 = archiver.sync_all(target, only={"dynamics"}, full=True, limit_override=2)
+    assert r1["dynamics"].saved == 2
+
+    r2 = archiver.sync_all(target, only={"dynamics"}, full=True, limit_override=2)
+    assert r2["dynamics"].saved == 2
+    assert state.count_namespace_archive(target.id, "dynamics") == 4
+
+
+def test_favorites_fingerprint_skips_unchanged_and_resyncs_on_change(tmp_path: Path) -> None:
+    target = _make_target(tmp_path)
+    state = StateStore(target.state_dir)
+
+    class _FavClient(_FakeBilibiliClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.media_count = 1
+            self.resource_calls = 0
+
+        def get_created_favorites(self, uid: int) -> dict[str, Any]:
+            return {"list": [{"id": 777, "title": "参考资料", "media_count": self.media_count, "mtime": 1700000000}]}
+
+        def get_favorite_resources_page(self, media_id: int, *, pn: int = 1, ps: int = 20) -> dict[str, Any]:
+            self.resource_calls += 1
+            return super().get_favorite_resources_page(media_id, pn=pn, ps=ps)
+
+    client = _FavClient()
+    archiver = BilibiliArchiver(state, client_factory=lambda _: client)
+
+    # First sync fetches folder pages
+    r1 = archiver.sync_all(target, only={"favorites"}, full=False)
+    assert r1["favorites"].saved == 1
+    assert client.resource_calls == 1
+
+    # Second incremental sync with unchanged count/mtime skips pagination
+    r2 = archiver.sync_all(target, only={"favorites"}, full=False)
+    assert r2["favorites"].saved == 0
+    assert r2["favorites"].already_archived == 1
+    assert client.resource_calls == 1
+
+    # Full sync forces re-fetch even if unchanged
+    r_full = archiver.sync_all(target, only={"favorites"}, full=True)
+    assert r_full["favorites"].saved == 1
+    assert client.resource_calls == 2
+
+    # Changing media_count triggers incremental re-sync
+    client.media_count = 2
+    r3 = archiver.sync_all(target, only={"favorites"}, full=False)
+    assert r3["favorites"].saved == 1
+    assert client.resource_calls == 3
+
+
+def test_comments_recent_refresh_window_and_retry_writes_sqlite(tmp_path: Path) -> None:
+    cfg = AppConfig(
+        paths={"download_dir": str(tmp_path / "dl"), "state_dir": str(tmp_path / "state")},
+        targets=[
+            TargetConfig(
+                id="bili_cmt",
+                source="23191782",
+                archive=BilibiliArchiveConfig(
+                    comments=CommentArchiveConfig(
+                        enabled=True,
+                        targets=["videos"],
+                        top_n=10,
+                        refresh_recent_days=7,
+                    )
+                ),
+            )
+        ],
+    )
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    state = StateStore(target.state_dir)
+    target.download_dir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc)
+    recent_ts = int((now - timedelta(days=2)).timestamp())
+    old_ts = int((now - timedelta(days=30)).timestamp())
+
+    # Two videos: BV17x411w7KC (recent) and BV1xx411c7mD (old)
+    (target.download_dir / "2026-11-22 - 近期视频 [BV17x411w7KC].info.json").write_text(
+        json.dumps({"id": "BV17x411w7KC", "title": "近期视频", "timestamp": recent_ts}),
+        encoding="utf-8",
+    )
+    (target.download_dir / "2026-10-20 - 历史视频 [BV1xx411c7mD].info.json").write_text(
+        json.dumps({"id": "BV1xx411c7mD", "title": "历史视频", "timestamp": old_ts}),
+        encoding="utf-8",
+    )
+
+    client = _FakeBilibiliClient()
+    archiver = BilibiliArchiver(state, client_factory=lambda _: client)
+
+    # Test --full --limit 1 fetches only 1 carrier
+    r_batch = archiver.sync_all(target, only={"comments"}, full=True, limit_override=1)
+    assert r_batch["comments"].saved == 1
+
+    # Fetch remaining carrier
+    r_rest = archiver.sync_all(target, only={"comments"}, full=True)
+    assert r_rest["comments"].saved == 1
+
+    # Immediate re-sync: both inside 12h cooldown -> 0 saved
+    r_cool = archiver.sync_all(target, only={"comments"}, full=False)
+    assert r_cool["comments"].saved == 0
+    assert r_cool["comments"].already_archived == 2
+
+    # Backdate archive timestamps to 24h ago: only the recent video (2d old <= 7d) refreshes
+    stale_iso = (now - timedelta(hours=24)).replace(microsecond=0).isoformat()
+    for key in list(state.read_namespace_archive(target.id, "comments")):
+        state.append_namespace_archive(target.id, "comments", key, meta=stale_iso, update_meta=True)
+
+    r_win = archiver.sync_all(target, only={"comments"}, full=False)
+    assert r_win["comments"].saved == 1
+    assert r_win["comments"].already_archived == 1
+
+    # Verify retry_failed_item for comment writes to SQLite as well
+    with ArchiveDB(state.state_dir / "biliyt.db") as db:
+        db.reset()
+        assert db.stats()["counts"]["comments"] == 0
+
+    retry_rec = FailedRecord(
+        target_id=target.id,
+        platform="bilibili",
+        url="https://www.bilibili.com/video/BV17x411w7KC",
+        video_id="video:170001",
+        title="评论: 近期视频",
+        error="timeout",
+        item_type="comment",
+        extra={
+            "carrier_kind": "videos",
+            "oid": "170001",
+            "rtype": 1,
+            "title": "近期视频",
+            "json_path": str(target.download_dir / "retry.comments.json"),
+            "md_path": str(target.download_dir / "retry.comments.md"),
+            "archive_key": "video:170001",
+        },
+    )
+    outcome, detail = archiver.retry_failed_item(target, retry_rec)
+    assert outcome == "downloaded", detail
+    with ArchiveDB(state.state_dir / "biliyt.db") as db:
+        assert db.stats()["counts"]["comments"] >= 3

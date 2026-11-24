@@ -1,0 +1,56 @@
+name: Bug Report
+description: 反馈程序报错、下载异常或归档数据不一致问题
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先阅读 [常见问题与运维排查](https://github.com/chosenecho/biliyt-archiver/blob/main/docs/troubleshooting.md)，并尝试升级 `yt-dlp` 到最新版本。
+        **隐私提醒**：请务必删除日志中的 `SESSDATA`、`bili_jct`、完整 `cookies.txt` 内容及代理账密。
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 涉及平台 / 模块
+      options:
+        - Bilibili 视频下载
+        - Bilibili 扩展归档（动态 / 专栏 / 收藏夹 / 评论）
+        - YouTube 视频下载
+        - SQLite 索引 / 全文搜索
+        - CLI / 配置解析 / 安装
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 清晰描述发生了什么，以及你期望的行为是什么。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤与命令
+      placeholder: |
+        1. 运行命令：biliyt sync --target ...
+        2. 脱敏后的关键配置片段...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境（biliyt check 脱敏输出）
+      description: 贴上 OS、Python 版本以及 `biliyt check` 的脱敏结果。
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 报错日志（脱敏后）
+      render: text

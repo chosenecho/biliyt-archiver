@@ -4,7 +4,7 @@
 
 ### Q1：只能下载 360P / 480P，没有 1080P 或 4K？
 B 站对未登录请求限制画质，且 1080P 高码率 / 4K / HDR / 杜比需要大会员 Cookie（含 `SESSDATA`）。
-- **解决**：在 `config.yaml` 的 `platforms.bilibili.auth` 下配置 `cookies_file`（或 `cookies_from_browser`），然后运行 `.\biliyt.cmd check` 确认文件有效。
+- **解决**：在 `config.yaml` 的 `platforms.bilibili.auth` 下配置 `cookies_file`（或 `cookies_from_browser`），然后运行 `biliyt check` 确认文件有效。
 
 ### Q2：批量抓取时报错 `HTTP Error 412` 或 `-352` 风控？
 请求频率过高或单次翻页过多触发了 B 站风控。
@@ -12,7 +12,7 @@ B 站对未登录请求限制画质，且 1080P 高码率 / 4K / HDR / 杜比需
   1. 将 `filters.recent_limit` 控制在 `10~30`，日常增量无需拉取全量历史列表。
   2. 适当调大 `platforms.bilibili.rate_limit` 中的 `sleep_interval`（如 `5.0~12.0`）和 `sleep_requests`（如 `2.0`）。
   3. 导出最新的浏览器 `cookies.txt`（包含 `buvid3` / `SESSDATA`）。
-  4. 等待 10~30 分钟后执行 `.\biliyt.cmd sync --retry-failed` 补下失败条目。
+  4. 等待 10~30 分钟后执行 `biliyt sync --retry-failed` 补下失败条目。
 
 ### Q3：如何下载 B 站弹幕？
 在全局或单个 B 站目标下设置 `media.write_danmaku: true`，`biliyt` 会自动拉取原始 XML 弹幕文件（`*.danmaku.xml`）。如需转成带滚动效果的 `.ass` 字幕，可用 DanmakuFactory 或 `yt-dlp-danmaku` 后续处理。
@@ -23,7 +23,7 @@ B 站对未登录请求限制画质，且 1080P 高码率 / 4K / HDR / 杜比需
 
 ### Q1：提示 `No supported JavaScript runtime` 或只能下载低画质？
 自 yt-dlp `2025.11.12` 起，YouTube 需要外部 JS 运行时（Deno 2.3+ 或 Node.js 20+）配合 `yt-dlp-ejs`。
-- **排查**：运行 `.\biliyt.cmd check`，确认 `yt-dlp-ejs` 与 `JS Runtime` 均为 `OK`。
+- **排查**：运行 `biliyt check`，确认 `yt-dlp-ejs` 与 `JS Runtime` 均为 `OK`。
 - `biliyt` 在 `platforms.youtube.js_runtime: "auto"` 下会自动检测 Deno 或 Node.js 并注入，无需手动传 `--js-runtimes`。
 
 ### Q2：报错 `Sign in to confirm you're not a bot` 或 `HTTP Error 403`？
@@ -42,8 +42,13 @@ B 站对未登录请求限制画质，且 1080P 高码率 / 4K / HDR / 杜比需
 Windows 下 Chrome / Edge 运行时会独占锁定 `Cookies` SQLite 文件，且新版本启用了 App-Bound Encryption。
 - **解决**：优先改用 `cookies_file`（使用浏览器插件导出 Netscape 格式 `cookies.txt` 到 `cookies/` 目录），最稳定且无需关闭浏览器。
 
-### Q2：PowerShell 报错“未对文件进行数字签名，无法运行脚本”？
-请直接使用批处理入口 **`.\biliyt.cmd`**，不要使用 `.ps1` 脚本。`biliyt.cmd` 在 PowerShell、CMD 以及 Windows 任务计划程序中均可直接运行。
+### Q2：PowerShell 执行策略拦截或本地 `.venv` 报错 `_ssl` / `_ctypes` DLL 加载失败？
+- **优先使用全局 CLI**：通过 `uv tool install` 安装的 `biliyt` 在 Windows 上会生成原生可执行文件 `biliyt.exe`（可用 `where.exe biliyt` 查看路径），在 PowerShell、CMD 与 Windows 任务计划程序中均可直接运行，不受 `.ps1` 执行策略限制。
+- **源码模式 `.venv` 异常回退**：若直接从仓库运行 `uv run biliyt` 时遇到 `.venv\Scripts\python.exe` 加载 `_ssl` / `_ctypes` DLL 失败，可用系统 Python 配合 `PYTHONPATH` 运行：
+  ```powershell
+  $env:PYTHONPATH = "$PWD\.venv\Lib\site-packages;$PWD\src"
+  python -m biliyt check
+  ```
 
 ---
 
@@ -51,16 +56,19 @@ Windows 下 Chrome / Edge 运行时会独占锁定 `Cookies` SQLite 文件，且
 
 B 站与 YouTube 接口变更频繁，遇到解析报错时**第一步永远是更新 `yt-dlp`**：
 
-```powershell
-# 升级到最新稳定版
-uv lock --upgrade-package yt-dlp --upgrade-package yt-dlp-ejs
-uv sync --python-preference only-system --python 3.12
+```bash
+# 全局 CLI 安装方式（推荐）：升级工具与底层依赖
+uv tool upgrade biliyt
 
-# 或升级到官方推荐的 nightly 预发布版
-uv pip install --python .\.venv\Scripts\python.exe -U --pre "yt-dlp[default,curl-cffi]"
+# 源码开发模式：升级锁文件并同步依赖
+uv lock --upgrade-package yt-dlp --upgrade-package yt-dlp-ejs
+uv sync
+
+# 源码开发模式：如需升级到 yt-dlp nightly 预发布版
+uv pip install -U --pre "yt-dlp[default,curl-cffi]"
 ```
 
-更新后运行 `.\biliyt.cmd check` 确认版本号生效。
+更新后运行 `biliyt check` 确认版本号生效。
 
 ---
 
@@ -69,6 +77,6 @@ uv pip install --python .\.venv\Scripts\python.exe -U --pre "yt-dlp[default,curl
 | 路径 | 作用 | 操作建议 |
 | :--- | :--- | :--- |
 | `state/archives/<target_id>.txt` | 记录目标已成功下载的视频 ID | 想重下某条视频时，删除对应行；想重下整个目标时，删除该文件。 |
-| `state/failed.jsonl` | 记录下载失败的条目及重试次数 | 运行 `.\biliyt.cmd sync --retry-failed` 补下；成功后自动移除。 |
+| `state/failed.jsonl` | 记录下载失败的条目及重试次数 | 运行 `biliyt sync --retry-failed` 补下；成功后自动移除。 |
 | `state/reports/run_*.json` | 每次正式同步的明细报告 | 可直接被外部脚本读取用于通知或审计。 |
-| `state/last_run.json` | 最近一次运行摘要 | `.\biliyt.cmd status` 的数据来源。 |
+| `state/last_run.json` | 最近一次运行摘要 | `biliyt status` 的数据来源。 |

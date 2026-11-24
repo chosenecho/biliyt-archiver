@@ -1,9 +1,12 @@
-# Python / uv
+# Python / uv / build
 .venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
+build/
+dist/
 
 # Runtime outputs & secrets
 config.yaml

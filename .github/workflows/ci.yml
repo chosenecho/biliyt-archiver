@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run Ruff check
+        run: uvx ruff check src tests
+
+  test:
+    name: Test (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Run pytest
+        run: uv run pytest -v
+
+  build:
+    name: Build & Wheel Smoke Test
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Verify wheel installs and runs outside repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/*.whl)
+          WORKDIR=$(mktemp -d)
+          uv venv "$WORKDIR/venv"
+          uv pip install --python "$WORKDIR/venv/bin/python" "$WHEEL"
+          cd "$WORKDIR"
+          "$WORKDIR/venv/bin/biliyt" --help
+          "$WORKDIR/venv/bin/biliyt" init --config "$WORKDIR/test-config.yaml"
+          test -f "$WORKDIR/test-config.yaml"
+          test -d "$WORKDIR/cookies"

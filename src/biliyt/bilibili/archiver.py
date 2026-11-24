@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -57,8 +58,56 @@ def bv_to_av(bvid: str) -> int | None:
     return (tmp & _BV_MASK_CODE) ^ _BV_XOR_CODE
 
 
+_COMMENT_REFRESH_MIN_INTERVAL = timedelta(hours=12)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return _utc_now().isoformat()
+
+
+def _parse_unix_datetime(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)) and value > 0:
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    return None
+
+
+def _parse_upload_date(raw: Any) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if len(cleaned) == 8 and cleaned.isdigit():
+        try:
+            return datetime.strptime(cleaned, "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_iso_datetime(raw: str) -> datetime | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _favorite_fingerprint(folder: dict[str, Any], title: str) -> str:
+    count = folder.get("media_count")
+    mtime = folder.get("mtime") or folder.get("ctime") or ""
+    title_hash = hashlib.sha1(title.encode("utf-8")).hexdigest()[:12]
+    return f"count={count}|mtime={mtime}|title={title_hash}"
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -109,6 +158,7 @@ class _CommentCarrier:
     md_path: Path
     archive_key: str
     source_url: str
+    published_at: datetime | None = None
 
 
 class BilibiliArchiver:
@@ -362,10 +412,12 @@ class BilibiliArchiver:
         stats = ExtendedModuleStats()
         self._emit("ext_module_start", target=target, module="dynamics")
         archived = self.state.read_namespace_archive(target.id, "dynamics")
-        effective_limit = None if full else (limit_override if limit_override is not None else target.archive.dynamics_limit)
+        scan_limit = None if full else target.archive.dynamics_limit
+        save_limit = limit_override
 
         offset = ""
         consecutive_archived = 0
+        pending_seen = 0
         stop = False
 
         while not stop:
@@ -378,7 +430,10 @@ class BilibiliArchiver:
                 dyn_id = str(item.get("id_str") or "")
                 if not dyn_id:
                     continue
-                if effective_limit is not None and stats.discovered >= effective_limit:
+                if scan_limit is not None and stats.discovered >= scan_limit:
+                    stop = True
+                    break
+                if save_limit is not None and (pending_seen if dry_run else stats.saved) >= save_limit:
                     stop = True
                     break
 
@@ -396,6 +451,7 @@ class BilibiliArchiver:
                     continue
 
                 consecutive_archived = 0
+                pending_seen += 1
                 if dry_run:
                     continue
 
@@ -536,10 +592,13 @@ class BilibiliArchiver:
         stats = ExtendedModuleStats()
         self._emit("ext_module_start", target=target, module="articles")
         archived = self.state.read_namespace_archive(target.id, "articles")
-        effective_limit = None if full else (limit_override if limit_override is not None else target.archive.articles_limit)
+        scan_limit = None if full else target.archive.articles_limit
+        save_limit = limit_override
 
         pn = 1
         ps = 30
+        consecutive_archived = 0
+        pending_seen = 0
         stop = False
         while not stop:
             page = client.get_articles_page(uid, pn=pn, ps=ps)
@@ -551,7 +610,10 @@ class BilibiliArchiver:
                 cv_id = str(meta.get("id") or "")
                 if not cv_id:
                     continue
-                if effective_limit is not None and stats.discovered >= effective_limit:
+                if scan_limit is not None and stats.discovered >= scan_limit:
+                    stop = True
+                    break
+                if save_limit is not None and (pending_seen if dry_run else stats.saved) >= save_limit:
                     stop = True
                     break
 
@@ -559,8 +621,14 @@ class BilibiliArchiver:
                 key = f"cv{cv_id}"
                 if key in archived:
                     stats.already_archived += 1
+                    consecutive_archived += 1
+                    if not full and consecutive_archived >= 2:
+                        stop = True
+                        break
                     continue
 
+                consecutive_archived = 0
+                pending_seen += 1
                 if dry_run:
                     continue
 
@@ -608,6 +676,7 @@ class BilibiliArchiver:
         client: BilibiliWebClient,
         uid: int,
         *,
+        full: bool = False,
         dry_run: bool = False,
     ) -> ExtendedModuleStats:
         stats = ExtendedModuleStats()
@@ -622,6 +691,7 @@ class BilibiliArchiver:
             return stats
 
         fav_dir = target.download_dir / "favorites"
+        archived_favs = self.state.read_namespace_archive_meta(target.id, "favorites")
         index_entries: list[dict[str, Any]] = []
 
         for folder in folders:
@@ -631,6 +701,23 @@ class BilibiliArchiver:
             title = str(folder.get("title") or f"fav_{media_id}")
             safe_title = sanitize_filename(title, max_len=60, fallback=f"fav_{media_id}")
             base_name = f"fav_{media_id}_{safe_title}"
+            json_path = fav_dir / f"{base_name}.json"
+            md_path = fav_dir / f"{base_name}.md"
+            fav_key = f"fav:{media_id}"
+            fp = _favorite_fingerprint(folder, title)
+
+            folder_copy = dict(folder)
+            folder_copy["_md_filename"] = f"{base_name}.md"
+
+            if (
+                not full
+                and archived_favs.get(fav_key) == fp
+                and json_path.exists()
+                and md_path.exists()
+            ):
+                stats.already_archived += 1
+                index_entries.append(folder_copy)
+                continue
 
             medias: list[dict[str, Any]] = []
             pn = 1
@@ -645,7 +732,7 @@ class BilibiliArchiver:
                     pn += 1
 
                 _write_json(
-                    fav_dir / f"{base_name}.json",
+                    json_path,
                     {
                         "fetched_at": _utc_now_iso(),
                         "folder": folder,
@@ -653,7 +740,7 @@ class BilibiliArchiver:
                     },
                 )
                 _write_text(
-                    fav_dir / f"{base_name}.md",
+                    md_path,
                     render_favorite_folder_markdown(folder, medias),
                 )
                 with self._open_db() as db:
@@ -662,8 +749,13 @@ class BilibiliArchiver:
                         folder=folder,
                         medias=medias,
                     )
-                folder_copy = dict(folder)
-                folder_copy["_md_filename"] = f"{base_name}.md"
+                self.state.append_namespace_archive(
+                    target.id,
+                    "favorites",
+                    fav_key,
+                    meta=fp,
+                    update_meta=True,
+                )
                 index_entries.append(folder_copy)
                 stats.saved += 1
             except (BilibiliRiskControlError, BilibiliAuthError):
@@ -672,7 +764,7 @@ class BilibiliArchiver:
                 stats.failed += 1
                 stats.errors.append(f"favorite {media_id}: {exc}")
 
-        if index_entries:
+        if index_entries and (stats.saved > 0 or not (fav_dir / "index.md").exists()):
             _write_text(fav_dir / "index.md", render_favorites_index_markdown(uid, index_entries))
 
         self._emit("ext_module_done", target=target, module="favorites", stats=stats)
@@ -878,6 +970,11 @@ class BilibiliArchiver:
                     if not aid:
                         continue
                     stem = info_file.name[: -len(".info.json")]
+                    pub_dt = (
+                        _parse_unix_datetime(info.get("timestamp"))
+                        or _parse_unix_datetime(info.get("release_timestamp"))
+                        or _parse_upload_date(info.get("upload_date"))
+                    )
                     carriers.append(
                         _CommentCarrier(
                             kind="videos",
@@ -888,6 +985,7 @@ class BilibiliArchiver:
                             md_path=info_file.with_name(f"{stem}.comments.md"),
                             archive_key=f"video:{aid}",
                             source_url=str(info.get("webpage_url") or f"https://www.bilibili.com/video/{bvid}"),
+                            published_at=pub_dt,
                         )
                     )
 
@@ -903,6 +1001,7 @@ class BilibiliArchiver:
                     meta = payload.get("meta") or {}
                     if not cv_id:
                         continue
+                    pub_dt = _parse_unix_datetime(meta.get("publish_time"))
                     carriers.append(
                         _CommentCarrier(
                             kind="articles",
@@ -913,6 +1012,7 @@ class BilibiliArchiver:
                             md_path=art_file.with_name("comments.md"),
                             archive_key=f"article:{cv_id}",
                             source_url=f"https://www.bilibili.com/read/cv{cv_id}",
+                            published_at=pub_dt,
                         )
                     )
 
@@ -930,6 +1030,8 @@ class BilibiliArchiver:
                     rtype = int(basic.get("comment_type") or 17)
                     if not oid:
                         continue
+                    author_mod = (item.get("modules") or {}).get("module_author") or {}
+                    pub_dt = _parse_unix_datetime(author_mod.get("pub_ts"))
                     carriers.append(
                         _CommentCarrier(
                             kind="dynamics",
@@ -940,10 +1042,28 @@ class BilibiliArchiver:
                             md_path=dyn_file.with_name("comments.md"),
                             archive_key=f"dynamic:{rtype}:{oid}",
                             source_url=f"https://t.bilibili.com/{dyn_id}",
+                            published_at=pub_dt,
                         )
                     )
 
         return carriers
+
+    def _should_refresh_archived_comment(
+        self,
+        carrier: _CommentCarrier,
+        *,
+        last_fetched_meta: str,
+        refresh_recent_days: int,
+        now: datetime,
+    ) -> bool:
+        if refresh_recent_days <= 0 or carrier.published_at is None:
+            return False
+        if (now - carrier.published_at) > timedelta(days=refresh_recent_days):
+            return False
+        last_fetched = _parse_iso_datetime(last_fetched_meta)
+        if last_fetched is not None and (now - last_fetched) < _COMMENT_REFRESH_MIN_INTERVAL:
+            return False
+        return True
 
     def sync_comments(
         self,
@@ -964,17 +1084,27 @@ class BilibiliArchiver:
             return stats
 
         carriers = self._discover_comment_carriers(target)
-        archived = self.state.read_namespace_archive(target.id, "comments")
-        effective_limit = None if full else limit_override
+        archived_meta = self.state.read_namespace_archive_meta(target.id, "comments")
+        # Always respect explicit `--limit N` (even with `--full`) so comment backfill can run in batches.
+        effective_limit = limit_override
+        now = _utc_now()
+        pending_seen = 0
 
         for carrier in carriers:
-            if effective_limit is not None and stats.saved >= effective_limit:
+            if effective_limit is not None and (pending_seen if dry_run else stats.saved) >= effective_limit:
                 break
             stats.discovered += 1
-            if not refresh and carrier.archive_key in archived:
-                stats.already_archived += 1
-                continue
+            if not refresh and carrier.archive_key in archived_meta:
+                if not self._should_refresh_archived_comment(
+                    carrier,
+                    last_fetched_meta=archived_meta.get(carrier.archive_key, ""),
+                    refresh_recent_days=ccfg.refresh_recent_days,
+                    now=now,
+                ):
+                    stats.already_archived += 1
+                    continue
 
+            pending_seen += 1
             if dry_run:
                 continue
 
@@ -1014,13 +1144,15 @@ class BilibiliArchiver:
                         bundle=bundle,
                         up_uid=uid,
                     )
+                fetched_iso = _utc_now_iso()
                 self.state.append_namespace_archive(
                     target.id,
                     "comments",
                     carrier.archive_key,
-                    meta=_utc_now_iso(),
+                    meta=fetched_iso,
+                    update_meta=True,
                 )
-                archived.add(carrier.archive_key)
+                archived_meta[carrier.archive_key] = fetched_iso
                 self.state.remove_failure(target.id, carrier.source_url, item_type="comment")
                 stats.saved += 1
             except (BilibiliRiskControlError, BilibiliAuthError):
@@ -1037,6 +1169,7 @@ class BilibiliArchiver:
                     error=str(exc),
                     item_type="comment",
                     extra={
+                        "carrier_kind": carrier.kind,
                         "oid": carrier.oid,
                         "rtype": carrier.rtype,
                         "title": carrier.title,
@@ -1095,7 +1228,13 @@ class BilibiliArchiver:
                 if wanted_profile:
                     results["profile"] = self.sync_profile(target, client, uid, dry_run=dry_run)
                 if wanted_favorites:
-                    results["favorites"] = self.sync_favorites(target, client, uid, dry_run=dry_run)
+                    results["favorites"] = self.sync_favorites(
+                        target,
+                        client,
+                        uid,
+                        full=full,
+                        dry_run=dry_run,
+                    )
                 if wanted_articles:
                     results["articles"] = self.sync_articles(
                         target,
@@ -1173,12 +1312,35 @@ class BilibiliArchiver:
                             up_uid=uid,
                         ),
                     )
+                    raw_kind = str(extra.get("carrier_kind") or "")
+                    if not raw_kind and ":" in archive_key:
+                        raw_kind = archive_key.split(":", 1)[0]
+                    carrier_kind_singular = {
+                        "videos": "video",
+                        "video": "video",
+                        "dynamics": "dynamic",
+                        "dynamic": "dynamic",
+                        "articles": "article",
+                        "article": "article",
+                    }.get(raw_kind, "video" if rtype == 1 else ("article" if rtype == 12 else "dynamic"))
+                    with self._open_db() as db:
+                        db.upsert_comments(
+                            target_id=target.id,
+                            carrier_kind=carrier_kind_singular,
+                            oid=oid,
+                            rtype=rtype,
+                            carrier_title=title,
+                            source_url=record.url,
+                            bundle=bundle,
+                            up_uid=uid,
+                        )
                     if archive_key:
                         self.state.append_namespace_archive(
                             target.id,
                             "comments",
                             archive_key,
                             meta=_utc_now_iso(),
+                            update_meta=True,
                         )
                     self.state.remove_failure(target.id, record.url, item_type="comment")
                     return "downloaded", ""

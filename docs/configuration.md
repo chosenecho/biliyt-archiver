@@ -18,13 +18,15 @@
 paths:
   download_dir: "./downloads"
   state_dir: "./state"
+  temp_dir: null
   filename_template: "%(upload_date>%Y-%m-%d|unknown)s - %(title).120B [%(id)s].%(ext)s"
 ```
 
 | 字段 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `download_dir` | `./downloads` | 下载根目录。每个目标默认输出到 `<download_dir>/<platform>/<target.id>/`，可通过单目标 `output_subdir` 自定义。 |
-| `state_dir` | `./state` | 状态目录，包含 `archives/<target.id>.txt`、`failed.jsonl`、`last_run.json` 与 `reports/`。 |
+| `state_dir` | `./state` | 状态目录，包含 `archives/<target.id>.txt`、`failed.jsonl`、`last_run.json`、`reports/` 与 `biliyt.db`。 |
+| `temp_dir` | `null` | 可选临时下载/混流目录。留空时直接在目标目录内暂存；下载目录位于机械盘或 NAS 时可指向本地 SSD。 |
 | `filename_template` | 见上 | yt-dlp 输出文件名模板。程序默认开启 `windowsfilenames: true`，自动清理 Windows 非法字符。 |
 
 ---
@@ -78,6 +80,7 @@ media:
 filters:
   recent_limit: 20
   max_downloads: null
+  early_stop_after: 3
   date_after: "now-30days"
   date_before: null
   min_duration: 60
@@ -93,6 +96,7 @@ filters:
 | :--- | :--- | :--- |
 | `recent_limit` | `int \| null` | 探查阶段最多拉取目标最新 N 条投稿（对应 yt-dlp `playlistend`）。定时增量同步建议设为 `10~50`，避免翻页触发风控。 |
 | `max_downloads` | `int \| null` | 单次同步每个目标最多实际下载的新视频条数。 |
+| `early_stop_after` | `int \| null` | 增量探查早停阈值（默认 `3`）：配合 `lazy_playlist` 连续遇到 N 条已归档视频即停止向后翻页；`--full` 自动忽略，`null` 关闭。 |
 | `date_after` / `date_before` | `str \| null` | 发布日期区间，支持 `YYYYMMDD`（如 `"20260101"`）或相对日期（如 `"now-7days"`、`"now-1month"`）。 |
 | `min_duration` / `max_duration` | `int \| null` | 视频时长门槛（单位：秒）。 |
 | `include_keywords` | `list[str]` | 白名单关键词（匹配标题或标签，不区分大小写，命中任一即通过）。 |
@@ -111,6 +115,7 @@ rate_limit:
   max_sleep_interval: 8.0
   sleep_requests: 1.0
   concurrent_fragments: 4
+  concurrency: 1
   retries: 5
   rate_limit: null
 ```
@@ -118,6 +123,7 @@ rate_limit:
 - `sleep_interval` / `max_sleep_interval`：相邻两个视频下载之间随机休眠的秒数区间。
 - `sleep_requests`：请求平台元数据接口的最小间隔秒数。
 - `concurrent_fragments`：单个视频 DASH/HLS 分片的并发下载线程数（建议 `4~8`）。
+- `concurrency`：单个目标内的视频并行下载任务数（范围 `1~8`，默认 `1`；提高并行度可加快大批量补档，但会提高 B 站/YouTube 触发风控的概率）。
 - `rate_limit`：带宽上限，如 `"5M"`、`"800K"`，`null` 不限速。
 
 ---
@@ -221,10 +227,12 @@ platforms:
         include_pinned: true
         include_up_replies: true
         max_sub_replies_per_root: 20
+        refresh_recent_days: 0   # 自动增量刷新最近 N 天内发布内容的评论（含 12 小时冷却；0 表示关闭）
 ```
 
 配合 `biliyt sync` 可按模块精准执行：
 - `biliyt sync --only profile,favorites`
 - `biliyt sync --only dynamics,articles --limit 10`
+- `biliyt sync --only videos --full --limit 15`（全量扫描但每批最多补下 15 条历史未归档视频）
 - `biliyt sync --only comments --refresh-comments`
 - `biliyt sync --full`（全量回溯历史）

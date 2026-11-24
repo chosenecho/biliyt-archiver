@@ -223,6 +223,8 @@ def build_probe_opts(
         opts["logger"] = logger
 
     if not full:
+        if target.filters.early_stop_after is not None:
+            opts["lazy_playlist"] = True
         effective_limit = limit_override if limit_override is not None else target.filters.recent_limit
         if effective_limit is not None:
             opts["playlistend"] = effective_limit
@@ -352,6 +354,9 @@ def build_download_opts(
         parsed_limit = parse_filesize(target.rate_limit.rate_limit)
         if parsed_limit:
             opts["ratelimit"] = parsed_limit
+
+    if target.rate_limit.sleep_requests > 0 and (opts["writesubtitles"] or opts["writeautomaticsub"]):
+        opts["sleep_interval_subtitles"] = target.rate_limit.sleep_requests
 
     if progress_hooks:
         opts["progress_hooks"] = progress_hooks

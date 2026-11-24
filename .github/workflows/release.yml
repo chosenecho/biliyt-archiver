@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          uv sync --locked
+          PKG_VERSION=$(uv run python -c "import tomllib, pathlib, biliyt; v1 = tomllib.loads(pathlib.Path('pyproject.toml').read_text('utf-8'))['project']['version']; v2 = biliyt.__version__; assert v1 == v2, f'{v1} != {v2}'; print(v1)")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) does not match package version ($PKG_VERSION)" >&2
+            exit 1
+          fi
+
+      - name: Run lint and tests
+        run: |
+          uvx ruff check src tests
+          uv run pytest -v
+
+      - name: Build distributions and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv build
+          (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS.txt)
+
+      - name: Smoke test wheel outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/*.whl)
+          WORKDIR=$(mktemp -d)
+          uv venv "$WORKDIR/venv"
+          uv pip install --python "$WORKDIR/venv/bin/python" "$WHEEL"
+          cd "$WORKDIR"
+          "$WORKDIR/venv/bin/biliyt" --help
+          "$WORKDIR/venv/bin/biliyt" init --config "$WORKDIR/config.yaml"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

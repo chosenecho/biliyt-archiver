@@ -1,6 +1,6 @@
 # SOP：biliyt SQLite 结构化存储与全文检索设计实施手册
 
-- **适用版本**：`biliyt v0.2+`（Python 3.11+ 标准库 `sqlite3`，本机实测 SQLite `3.49.1`，零新增第三方依赖）
+- **适用版本**：`biliyt v0.1.0+`（Python 3.11+ 标准库 `sqlite3`，零新增第三方依赖）
 - **数据库路径**：`<state_dir>/biliyt.db`（默认 `state/biliyt.db`，已在 `.gitignore` 中被 `state/` 忽略）
 - **核心架构原则**：**双写 + 可重建（Hybrid Architecture）**——大体积二进制与离线可读稿留在 `downloads/`，结构化元数据、字幕文本、评论树、运行日志与 FTS5 全文索引存入 SQLite。
 
@@ -117,7 +117,7 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
      - `favorites/fav_*.json`
      - 所有 `*.comments.json` 与 `*/comments.json`
    - 全程幂等 `UPSERT`，不发任何网络请求。
-2. 实测验证：对现有 `downloads/bilibili/bili_23191782/` 执行 `.\biliyt.cmd db rebuild`，验证已有 2 条视频（含字幕）+ 1 份档案 + 2 条动态 + 2 篇专栏 + 6 份评论全部秒级入库。
+2. 实测验证：对已有下载目录执行 `biliyt db rebuild`，验证视频（含字幕）、档案、动态、专栏与评论全部快速入库。
 
 ### M4：CLI 命令与文档
 在 `cli.py` 新增两类命令：
@@ -130,40 +130,40 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
 ## 4. 首次建库与日常使用 SOP（Ops SOP）
 
 ### Step 4.1 已有下载目录一键入库（首次启用）
-```powershell
+```bash
 # 1) 从现有 downloads/ 无损重建数据库（零网络请求）
-.\biliyt.cmd db rebuild
+biliyt db rebuild
 
 # 2) 查看入库统计
-.\biliyt.cmd db stats
+biliyt db stats
 
 # 3) 冒烟检索测试（验证中文短词与长词、视频字幕与专栏都能搜到）
-.\biliyt.cmd search "斯宾诺莎" --target bili_23191782
-.\biliyt.cmd search "工运" --target bili_23191782 --kind subtitle,comment
+biliyt search "关键词" --target bili_example
+biliyt search "字幕词" --target bili_example --kind subtitle,comment
 ```
 
 ### Step 4.2 后续全量/日常同步
 日常命令**完全不变**，同步时自动双写文件与 `state/biliyt.db`：
-```powershell
-.\biliyt.cmd sync
+```bash
+biliyt sync
 ```
 
 ### Step 4.3 常用 SQL 速查（可用 DB Browser for SQLite 或 Python 直接查询）
 
 - **查看 UP 主「视频 + 动态 + 专栏」统一时间轴（最近 30 条）**：
   ```sql
-  SELECT published_at, 'video' AS kind, video_id AS id, title FROM videos WHERE target_id='bili_23191782'
+  SELECT published_at, 'video' AS kind, video_id AS id, title FROM videos WHERE target_id='bili_example'
   UNION ALL
-  SELECT published_at, 'dynamic' AS kind, dynamic_id AS id, substr(text_content, 1, 60) FROM dynamics WHERE target_id='bili_23191782'
+  SELECT published_at, 'dynamic' AS kind, dynamic_id AS id, substr(text_content, 1, 60) FROM dynamics WHERE target_id='bili_example'
   UNION ALL
-  SELECT published_at, 'article' AS kind, cv_id AS id, title FROM articles WHERE target_id='bili_23191782'
+  SELECT published_at, 'article' AS kind, cv_id AS id, title FROM articles WHERE target_id='bili_example'
   ORDER BY published_at DESC LIMIT 30;
   ```
 - **导出该 UP 主所有「置顶评论 + UP 主本人发言」**：
   ```sql
   SELECT carrier_kind, oid, published_at, is_pinned, like_count, content
   FROM comments
-  WHERE target_id='bili_23191782' AND (is_pinned = 1 OR is_up = 1)
+  WHERE target_id='bili_example' AND (is_pinned = 1 OR is_up = 1)
   ORDER BY published_at DESC;
   ```
 - **查出已下载但尚未抓取评论的视频**：
@@ -171,7 +171,7 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
   SELECT v.video_id, v.title, v.upload_date
   FROM videos v
   LEFT JOIN comments c ON c.target_id = v.target_id AND c.carrier_kind = 'video' AND c.oid = v.aid
-  WHERE v.target_id = 'bili_23191782' AND c.rpid IS NULL;
+  WHERE v.target_id = 'bili_example' AND c.rpid IS NULL;
   ```
 
 ---
@@ -188,10 +188,10 @@ python -c "import sqlite3; c=sqlite3.connect('state/biliyt.db'); c.execute(\"VAC
 
 ### 5.2 数据库损坏或 Schema 异常的一键恢复
 因为文件层保留了完整的原始 `.json` 与 `.srt`，SQLite 属于**可完全再生资产**：
-```powershell
+```bash
 # 重置并从 downloads/ 全量无损重建
-.\biliyt.cmd db rebuild --reset
-.\biliyt.cmd db stats
+biliyt db rebuild --reset
+biliyt db stats
 ```
 
 ### 5.3 定期空间整理（每季度或大批量建档后执行 1 次）

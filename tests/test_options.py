@@ -6,6 +6,7 @@ from biliyt.config import AppConfig, FilterConfig, MediaConfig, resolve_target
 from biliyt.options import (
     build_download_opts,
     build_format_options,
+    build_probe_opts,
     detect_js_runtimes,
     evaluate_video_filters,
     parse_cookies_from_browser,
@@ -140,6 +141,7 @@ def test_build_download_opts_bilibili_and_youtube(tmp_path: Path, monkeypatch) -
     y_target = resolve_target(cfg, cfg.targets[1], tmp_path)
     y_opts = build_download_opts(y_target, archive_path=tmp_path / "y1.txt")
     assert "danmaku" not in y_opts["subtitleslangs"]
+    assert y_opts["sleep_interval_subtitles"] == y_target.rate_limit.sleep_requests
     assert y_opts["proxy"] == "http://127.0.0.1:7890"
     assert y_opts["js_runtimes"] == {"node": {"path": "/usr/bin/node"}}
     assert str(y_opts["impersonate"]) == "chrome"
@@ -163,3 +165,29 @@ def test_build_download_opts_sets_temp_dir(tmp_path: Path) -> None:
     opts = build_download_opts(target, archive_path=tmp_path / "b1.txt")
     assert opts["paths"]["home"] == str((tmp_path / "dl" / "bilibili" / "b1").resolve())
     assert opts["paths"]["temp"] == str((tmp_path / "fast_tmp").resolve())
+
+
+def test_build_probe_opts_lazy_playlist_and_full_mode(tmp_path: Path) -> None:
+    cfg = AppConfig.model_validate(
+        {
+            "filters": {"recent_limit": 20, "early_stop_after": 3},
+            "targets": [
+                {"id": "b1", "source": "946974"},
+                {"id": "b2", "source": "946974", "filters": {"early_stop_after": None}},
+            ],
+        }
+    )
+    t1 = resolve_target(cfg, cfg.targets[0], tmp_path)
+    t2 = resolve_target(cfg, cfg.targets[1], tmp_path)
+
+    inc_opts = build_probe_opts(t1, full=False)
+    assert inc_opts["lazy_playlist"] is True
+    assert inc_opts["playlistend"] == 20
+
+    full_opts = build_probe_opts(t1, limit_override=5, full=True)
+    assert "lazy_playlist" not in full_opts
+    assert "playlistend" not in full_opts
+
+    no_stop_opts = build_probe_opts(t2, full=False)
+    assert "lazy_playlist" not in no_stop_opts
+    assert no_stop_opts["playlistend"] == 20

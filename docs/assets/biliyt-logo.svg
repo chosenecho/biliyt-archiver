@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="biliyt-logo-title">
+  <title id="biliyt-logo-title">biliyt logo</title>
+  <defs>
+    <linearGradient id="screen-grad" x1="16" y1="24" x2="112" y2="82" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#142136" />
+      <stop offset="100%" stop-color="#1E304D" />
+    </linearGradient>
+    <linearGradient id="tray-grad" x1="22" y1="90" x2="106" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00A1D6" />
+      <stop offset="100%" stop-color="#3B82F6" />
+    </linearGradient>
+  </defs>
+  <g id="layer-antennae">
+    <path d="M40 10 L51 24" fill="none" stroke="#00A1D6" stroke-width="5" stroke-linecap="round" />
+    <path d="M88 10 L77 24" fill="none" stroke="#F43F5E" stroke-width="5" stroke-linecap="round" />
+  </g>
+  <g id="layer-screen">
+    <rect x="16" y="24" width="96" height="58" rx="14" fill="url(#screen-grad)" stroke="#4C6E9B" stroke-width="3" />
+  </g>
+  <g id="layer-streams">
+    <rect x="28" y="38" width="26" height="24" rx="7" fill="#00A1D6" />
+    <circle cx="36" cy="50" r="3.2" fill="#FFFFFF" />
+    <circle cx="46" cy="50" r="3.2" fill="#FFFFFF" />
+    <rect x="74" y="38" width="26" height="24" rx="7" fill="#EF4444" />
+    <polygon points="84,44 94,50 84,56" fill="#FFFFFF" />
+  </g>
+  <g id="layer-sync-arrow">
+    <path d="M64 38 L64 76" fill="none" stroke="#E2E8F0" stroke-width="4.5" stroke-linecap="round" />
+    <path d="M55 68 L64 78 L73 68" fill="none" stroke="#E2E8F0" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+  <g id="layer-archive-tray">
+    <rect x="24" y="92" width="80" height="10" rx="5" fill="url(#tray-grad)" />
+    <rect x="36" y="107" width="56" height="9" rx="4.5" fill="#64748B" />
+  </g>
+</svg>

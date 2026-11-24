@@ -83,3 +83,35 @@ def test_duplicate_target_ids_rejected() -> None:
 def test_invalid_duration_bounds_rejected() -> None:
     with pytest.raises(ValueError, match="min_duration"):
         AppConfig.model_validate({"filters": {"min_duration": 300, "max_duration": 60}})
+
+
+def test_config_example_yaml_loads_and_resolves() -> None:
+    example = Path(__file__).resolve().parents[1] / "config.example.yaml"
+    cfg, base_dir = load_config(example)
+    assert cfg.paths.temp_dir is None
+    assert cfg.rate_limit.concurrency == 1
+    assert cfg.filters.early_stop_after == 3
+    assert cfg.platforms[Platform.BILIBILI].archive is not None
+    assert cfg.platforms[Platform.BILIBILI].archive.comments.refresh_recent_days == 0
+    ids = [t.id for t in cfg.targets]
+    assert ids == ["bili_example", "yt_example"]
+    for t in cfg.targets:
+        resolved = resolve_target(cfg, t, base_dir)
+        assert resolved.url.startswith("https://")
+        assert resolved.enabled is False
+
+
+def test_cli_init_copies_template_and_creates_cookies_dir(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from biliyt.cli import app
+
+    out_cfg = tmp_path / "work" / "config.yaml"
+    runner = CliRunner()
+    result = runner.invoke(app, ["init", "--config", str(out_cfg)])
+    assert result.exit_code == 0, result.output
+    assert out_cfg.is_file()
+    assert (out_cfg.parent / "cookies").is_dir()
+    cfg, _ = load_config(out_cfg)
+    assert len(cfg.targets) == 2
+

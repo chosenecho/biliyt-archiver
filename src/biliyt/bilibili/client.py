@@ -406,7 +406,7 @@ class BilibiliWebClient:
                 "platform": "web",
             },
             signed=False,
-            referer=f"https://space.bilibili.com/",
+            referer="https://space.bilibili.com/",
         )
 
     def get_replies_main_page(
