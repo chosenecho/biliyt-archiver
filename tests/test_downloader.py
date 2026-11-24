@@ -1,5 +1,6 @@
 """Tests for SyncEngine two-stage pipeline, retry_failed, and CLI smoke tests."""
 
+import io
 from pathlib import Path
 from typing import Any
 
@@ -7,7 +8,7 @@ import pytest
 import yt_dlp
 from typer.testing import CliRunner
 
-from biliyt.cli import app
+from biliyt.cli import _configure_utf8_stdio, app
 from biliyt.config import AppConfig, resolve_target
 from biliyt.downloader import SyncEngine
 from biliyt.state import StateStore, SyncLockError
@@ -139,6 +140,19 @@ def test_cli_check_fails_when_ffmpeg_missing(tmp_path: Path, monkeypatch: pytest
     check_res = runner.invoke(app, ["check", "--config", str(cfg_path)])
     assert check_res.exit_code == 1
     assert "FFmpeg" in check_res.output
+
+
+def test_configure_utf8_stdio_reconfigures_legacy_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    fake_err = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr("biliyt.cli.sys.stdout", fake_out)
+    monkeypatch.setattr("biliyt.cli.sys.stderr", fake_err)
+
+    _configure_utf8_stdio()
+    assert fake_out.encoding.lower() == "utf-8"
+    assert fake_err.encoding.lower() == "utf-8"
+    fake_out.write("中文环境测试")
+    fake_out.flush()
 
 
 def test_sync_concurrent_downloads(tmp_path: Path) -> None:

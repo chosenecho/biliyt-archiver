@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -24,6 +25,21 @@ from .downloader import SyncEngine, build_run_report
 from .platform import Platform
 from .state import StateStore, SyncLockError
 
+
+def _configure_utf8_stdio() -> None:
+    """Ensure stdout/stderr use UTF-8 on legacy Windows codepages so Rich Chinese output never crashes."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure) and encoding and encoding.lower().replace("_", "-") != "utf-8":
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_configure_utf8_stdio()
+
 app = typer.Typer(
     name="biliyt",
     help="基于 yt-dlp 的 Bilibili / YouTube 目标用户批量增量下载与归档工作流",
@@ -36,6 +52,11 @@ db_app = typer.Typer(
 )
 app.add_typer(db_app, name="db")
 console = Console()
+
+
+@app.callback()
+def _main_callback() -> None:
+    _configure_utf8_stdio()
 
 
 def _load_and_select_targets(
