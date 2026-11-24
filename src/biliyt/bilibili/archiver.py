@@ -891,6 +891,31 @@ class BilibiliArchiver:
                         )
                     )
 
+        if "articles" in enabled_targets:
+            art_root = target.download_dir / "articles"
+            if art_root.is_dir():
+                for art_file in sorted(art_root.glob("*/article.json"), reverse=True):
+                    try:
+                        payload = json.loads(art_file.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        continue
+                    cv_id = str(payload.get("cv_id") or "")
+                    meta = payload.get("meta") or {}
+                    if not cv_id:
+                        continue
+                    carriers.append(
+                        _CommentCarrier(
+                            kind="articles",
+                            oid=cv_id,
+                            rtype=12,
+                            title=str(meta.get("title") or f"专栏 cv{cv_id}"),
+                            json_path=art_file.with_name("comments.json"),
+                            md_path=art_file.with_name("comments.md"),
+                            archive_key=f"article:{cv_id}",
+                            source_url=f"https://www.bilibili.com/read/cv{cv_id}",
+                        )
+                    )
+
         if "dynamics" in enabled_targets:
             dyn_root = target.download_dir / "dynamics"
             if dyn_root.is_dir():
@@ -915,31 +940,6 @@ class BilibiliArchiver:
                             md_path=dyn_file.with_name("comments.md"),
                             archive_key=f"dynamic:{rtype}:{oid}",
                             source_url=f"https://t.bilibili.com/{dyn_id}",
-                        )
-                    )
-
-        if "articles" in enabled_targets:
-            art_root = target.download_dir / "articles"
-            if art_root.is_dir():
-                for art_file in sorted(art_root.glob("*/article.json"), reverse=True):
-                    try:
-                        payload = json.loads(art_file.read_text(encoding="utf-8", errors="ignore"))
-                    except Exception:
-                        continue
-                    cv_id = str(payload.get("cv_id") or "")
-                    meta = payload.get("meta") or {}
-                    if not cv_id:
-                        continue
-                    carriers.append(
-                        _CommentCarrier(
-                            kind="articles",
-                            oid=cv_id,
-                            rtype=12,
-                            title=str(meta.get("title") or f"专栏 cv{cv_id}"),
-                            json_path=art_file.with_name("comments.json"),
-                            md_path=art_file.with_name("comments.md"),
-                            archive_key=f"article:{cv_id}",
-                            source_url=f"https://www.bilibili.com/read/cv{cv_id}",
                         )
                     )
 
