@@ -312,12 +312,15 @@ def build_download_opts(
         if target.platform == Platform.BILIBILI and target.archive.layout == "grouped"
         else target.download_dir
     )
+    paths_opt: dict[str, str] = {"home": str(video_home_dir)}
+    if target.temp_dir is not None:
+        paths_opt["temp"] = str(target.temp_dir)
 
     opts: dict[str, Any] = {
         "format": fmt,
         "format_sort": sort_order,
         "merge_output_format": media.container,
-        "paths": {"home": str(video_home_dir)},
+        "paths": paths_opt,
         "outtmpl": {"default": target.filename_template},
         "windowsfilenames": True,
         "nooverwrites": True,

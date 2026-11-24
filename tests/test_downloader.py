@@ -119,3 +119,37 @@ def test_cli_init_check_and_status(tmp_path: Path) -> None:
     status_res = runner.invoke(app, ["status", "--config", str(cfg_path)])
     assert status_res.exit_code == 0, status_res.output
     assert "bili_example" in status_res.output
+
+
+def test_sync_concurrent_downloads(tmp_path: Path) -> None:
+    cfg = AppConfig.model_validate(
+        {
+            "paths": {
+                "download_dir": str(tmp_path / "dl"),
+                "state_dir": str(tmp_path / "state"),
+                "temp_dir": str(tmp_path / "tmp"),
+            },
+            "rate_limit": {"concurrency": 3, "sleep_interval": 0.0, "max_sleep_interval": 0.0},
+            "targets": [{"id": "bili_conc", "source": "946974"}],
+        }
+    )
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    state = StateStore(target.state_dir)
+    feed = [
+        {"id": f"BV1conc{i}", "title": f"视频 {i}", "duration": 180, "url": f"https://www.bilibili.com/video/BV1conc{i}"}
+        for i in range(6)
+    ]
+    fail_urls = {"https://www.bilibili.com/video/BV1conc2"}
+
+    engine = SyncEngine(
+        state,
+        ydl_factory=lambda opts: _FakeYDL(opts, feed, fail_urls),
+        sleeper=lambda _: None,
+    )
+    summary = engine.sync_target(target, dry_run=False)
+    assert summary.discovered == 6
+    assert summary.downloaded == 5
+    assert summary.failed == 1
+    assert len(state.load_failed("bili_conc")) == 1
+    assert state.load_failed("bili_conc")[0].video_id == "BV1conc2"
+    assert (tmp_path / "tmp").is_dir()

@@ -17,7 +17,15 @@ TModel = TypeVar("TModel", bound=BaseModel)
 class PathsConfig(BaseModel):
     download_dir: str = "./downloads"
     state_dir: str = "./state"
+    temp_dir: str | None = None
     filename_template: str = "%(upload_date>%Y-%m-%d|unknown)s - %(title).120B [%(id)s].%(ext)s"
+
+    @field_validator("temp_dir", mode="before")
+    @classmethod
+    def _blank_temp_to_none(cls, v: Any) -> Any:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 
 class MediaConfig(BaseModel):
@@ -82,6 +90,7 @@ class RateLimitConfig(BaseModel):
     max_sleep_interval: float = Field(default=8.0, ge=0.0)
     sleep_requests: float = Field(default=1.0, ge=0.0)
     concurrent_fragments: int = Field(default=4, ge=1, le=32)
+    concurrency: int = Field(default=1, ge=1, le=8)
     retries: int = Field(default=5, ge=0)
     rate_limit: str | None = None
 
@@ -232,6 +241,7 @@ class ResolvedTarget:
     js_runtime: str | None
     extractor_args: dict[str, dict[str, list[str]]]
     archive: BilibiliArchiveConfig = field(default_factory=BilibiliArchiveConfig)
+    temp_dir: Path | None = None
 
 
 def _merge_model(base: TModel, override: TModel | None) -> TModel:
@@ -301,6 +311,7 @@ def resolve_target(config: AppConfig, target: TargetConfig, base_dir: Path) -> R
     subdir = target.output_subdir or f"{target.platform.value}/{target.id}"
     download_dir = (download_root / subdir).resolve()
     state_dir = _resolve_path(config.paths.state_dir, base_dir)
+    temp_dir = _resolve_path(config.paths.temp_dir, base_dir) if config.paths.temp_dir else None
 
     url = normalize_target_url(target.source, target.platform, youtube_tab=target.youtube_tab)
     return ResolvedTarget(
@@ -322,6 +333,7 @@ def resolve_target(config: AppConfig, target: TargetConfig, base_dir: Path) -> R
         js_runtime=js_runtime,
         extractor_args=merged_extractor_args,
         archive=archive,
+        temp_dir=temp_dir,
     )
 
 

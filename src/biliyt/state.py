@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,7 @@ class StateStore:
         self.reports_dir = state_dir / "reports"
         self.failed_file = state_dir / "failed.jsonl"
         self.last_run_file = state_dir / "last_run.json"
+        self._lock = threading.RLock()
 
     def ensure_dirs(self) -> None:
         self.archives_dir.mkdir(parents=True, exist_ok=True)
@@ -69,15 +71,16 @@ class StateStore:
         return self.archives_dir / f"{target_id}.txt"
 
     def read_archive_entries(self, target_id: str) -> set[str]:
-        path = self.archives_dir / f"{target_id}.txt"
-        if not path.exists():
-            return set()
-        entries: set[str] = set()
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            stripped = line.strip()
-            if stripped:
-                entries.add(stripped)
-        return entries
+        with self._lock:
+            path = self.archives_dir / f"{target_id}.txt"
+            if not path.exists():
+                return set()
+            entries: set[str] = set()
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                stripped = line.strip()
+                if stripped:
+                    entries.add(stripped)
+            return entries
 
     def read_archive_video_ids(self, target_id: str) -> set[str]:
         """Return bare video IDs extracted from '<extractor> <id>' lines."""
@@ -128,26 +131,28 @@ class StateStore:
         return len(self.read_namespace_archive(target_id, namespace))
 
     def load_failed(self, target_id: str | None = None) -> list[FailedRecord]:
-        if not self.failed_file.exists():
-            return []
-        records: list[FailedRecord] = []
-        for line in self.failed_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                rec = FailedRecord(**data)
-            except Exception:
-                continue
-            if target_id is None or rec.target_id == target_id:
-                records.append(rec)
-        return records
+        with self._lock:
+            if not self.failed_file.exists():
+                return []
+            records: list[FailedRecord] = []
+            for line in self.failed_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    rec = FailedRecord(**data)
+                except Exception:
+                    continue
+                if target_id is None or rec.target_id == target_id:
+                    records.append(rec)
+            return records
 
     def _write_failed(self, records: list[FailedRecord]) -> None:
-        self.ensure_dirs()
-        content = "\n".join(json.dumps(asdict(r), ensure_ascii=False) for r in records)
-        self.failed_file.write_text(f"{content}\n" if content else "", encoding="utf-8")
+        with self._lock:
+            self.ensure_dirs()
+            content = "\n".join(json.dumps(asdict(r), ensure_ascii=False) for r in records)
+            self.failed_file.write_text(f"{content}\n" if content else "", encoding="utf-8")
 
     def record_failure(
         self,
@@ -161,49 +166,50 @@ class StateStore:
         item_type: str = "video",
         extra: dict[str, object] | None = None,
     ) -> FailedRecord:
-        all_records = self.load_failed()
-        key = (target_id, item_type, url)
-        updated: FailedRecord | None = None
-        new_records: list[FailedRecord] = []
+        with self._lock:
+            all_records = self.load_failed()
+            key = (target_id, item_type, url)
+            updated: FailedRecord | None = None
+            new_records: list[FailedRecord] = []
 
-        for rec in all_records:
-            if (rec.target_id, rec.item_type, rec.url) == key:
-                merged_extra = dict(rec.extra)
-                if extra:
-                    merged_extra.update(extra)
+            for rec in all_records:
+                if (rec.target_id, rec.item_type, rec.url) == key:
+                    merged_extra = dict(rec.extra)
+                    if extra:
+                        merged_extra.update(extra)
+                    updated = FailedRecord(
+                        target_id=target_id,
+                        platform=platform,
+                        url=url,
+                        video_id=video_id or rec.video_id,
+                        title=title or rec.title,
+                        error=error,
+                        attempts=rec.attempts + 1,
+                        failed_at=_utc_now_iso(),
+                        item_type=item_type,
+                        extra=merged_extra,
+                    )
+                    new_records.append(updated)
+                else:
+                    new_records.append(rec)
+
+            if updated is None:
                 updated = FailedRecord(
                     target_id=target_id,
                     platform=platform,
                     url=url,
-                    video_id=video_id or rec.video_id,
-                    title=title or rec.title,
+                    video_id=video_id,
+                    title=title,
                     error=error,
-                    attempts=rec.attempts + 1,
+                    attempts=1,
                     failed_at=_utc_now_iso(),
                     item_type=item_type,
-                    extra=merged_extra,
+                    extra=dict(extra or {}),
                 )
                 new_records.append(updated)
-            else:
-                new_records.append(rec)
 
-        if updated is None:
-            updated = FailedRecord(
-                target_id=target_id,
-                platform=platform,
-                url=url,
-                video_id=video_id,
-                title=title,
-                error=error,
-                attempts=1,
-                failed_at=_utc_now_iso(),
-                item_type=item_type,
-                extra=dict(extra or {}),
-            )
-            new_records.append(updated)
-
-        self._write_failed(new_records)
-        return updated
+            self._write_failed(new_records)
+            return updated
 
     def remove_failure(
         self,
@@ -212,18 +218,19 @@ class StateStore:
         *,
         item_type: str | None = None,
     ) -> None:
-        all_records = self.load_failed()
-        remaining = [
-            r
-            for r in all_records
-            if not (
-                r.target_id == target_id
-                and r.url == url
-                and (item_type is None or r.item_type == item_type)
-            )
-        ]
-        if len(remaining) != len(all_records):
-            self._write_failed(remaining)
+        with self._lock:
+            all_records = self.load_failed()
+            remaining = [
+                r
+                for r in all_records
+                if not (
+                    r.target_id == target_id
+                    and r.url == url
+                    and (item_type is None or r.item_type == item_type)
+                )
+            ]
+            if len(remaining) != len(all_records):
+                self._write_failed(remaining)
 
     def save_report(self, report: RunReport) -> Path:
         self.ensure_dirs()

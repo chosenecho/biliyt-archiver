@@ -274,12 +274,14 @@ def sync(
         elif event == "item_done":
             outcome = payload["outcome"]
             detail = payload["detail"]
+            item = payload.get("item")
+            label = f" [{payload['index']}/{payload['total']}] {item.title}" if item else ""
             if outcome == "downloaded":
-                console.print("      [green]✓ 下载完成[/green]")
+                console.print(f"      [green]✓ 下载完成[/green]{label}")
             elif outcome == "filtered":
-                console.print(f"      [yellow]- 跳过: {detail}[/yellow]")
+                console.print(f"      [yellow]- 跳过: {detail}[/yellow]{label}")
             else:
-                console.print(f"      [red]✗ 失败: {detail}[/red]")
+                console.print(f"      [red]✗ 失败: {detail}[/red]{label}")
         elif event == "retry_start":
             rec = payload["record"]
             console.print(

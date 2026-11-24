@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import random
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -116,11 +118,14 @@ class SyncEngine:
         self._ydl_factory = ydl_factory or yt_dlp.YoutubeDL
         self._on_event = on_event
         self._sleeper = sleeper
+        self._event_lock = threading.Lock()
+        self._db_lock = threading.Lock()
         self.bili_archiver = bili_archiver or BilibiliArchiver(state, on_event=on_event)
 
     def _emit(self, event: str, **payload: Any) -> None:
         if self._on_event:
-            self._on_event(event, payload)
+            with self._event_lock:
+                self._on_event(event, payload)
 
     def probe_extended_bilibili(
         self,
@@ -237,8 +242,10 @@ class SyncEngine:
     ) -> tuple[str, str]:
         """Download one candidate URL. Returns `(outcome, detail)` where outcome in {'downloaded','filtered','archived','failed'}."""
         target.download_dir.mkdir(parents=True, exist_ok=True)
+        if target.temp_dir is not None:
+            target.temp_dir.mkdir(parents=True, exist_ok=True)
         archive_path = self.state.archive_path(target.id)
-        before_entries = self.state.read_archive_entries(target.id)
+        before_ids = self.state.read_archive_video_ids(target.id)
 
         downloaded_flag = False
         logger = _CaptureLogger()
@@ -284,8 +291,13 @@ class SyncEngine:
             )
             return "failed", err_msg
 
-        after_entries = self.state.read_archive_entries(target.id)
-        if downloaded_flag or len(after_entries) > len(before_entries):
+        after_ids = self.state.read_archive_video_ids(target.id)
+        newly_archived = (
+            _matches_archive(video_id, after_ids) and not _matches_archive(video_id, before_ids)
+            if video_id
+            else len(after_ids) > len(before_ids)
+        )
+        if downloaded_flag or newly_archived:
             self.state.remove_failure(target.id, url)
             self._index_downloaded_video(target, video_id)
             return "downloaded", "ok"
@@ -325,9 +337,10 @@ class SyncEngine:
         if not matched:
             return
         try:
-            with ArchiveDB(self.state.state_dir / "biliyt.db") as db:
-                for info_file in matched:
-                    index_video_info_file(db, target, info_file)
+            with self._db_lock:
+                with ArchiveDB(self.state.state_dir / "biliyt.db") as db:
+                    for info_file in matched:
+                        index_video_info_file(db, target, info_file)
         except Exception:
             pass
 
@@ -390,47 +403,118 @@ class SyncEngine:
 
                 self._emit("probe_done", target=target, probe=probe, max_downloads=max_dl)
 
-                if not dry_run:
-                    for idx, item in enumerate(candidates, start=1):
-                        if max_dl is not None and v_downloaded >= max_dl:
-                            break
+                if not dry_run and candidates:
+                    workers = min(max(1, target.rate_limit.concurrency), len(candidates))
+                    if workers == 1:
+                        for idx, item in enumerate(candidates, start=1):
+                            if max_dl is not None and v_downloaded >= max_dl:
+                                break
 
-                        self._emit(
-                            "item_start",
-                            target=target,
-                            index=idx,
-                            total=len(candidates),
-                            item=item,
-                        )
-                        outcome, detail = self._download_single(
-                            target,
-                            item.url,
-                            video_id=item.video_id,
-                            title=item.title,
-                        )
-                        if outcome == "downloaded":
-                            v_downloaded += 1
-                        elif outcome == "filtered":
-                            v_filtered += 1
-                        elif outcome == "archived":
-                            v_archived += 1
-                        else:
-                            v_failed += 1
-                            summary.errors.append(f"{item.title}: {detail}")
+                            self._emit(
+                                "item_start",
+                                target=target,
+                                index=idx,
+                                total=len(candidates),
+                                item=item,
+                            )
+                            outcome, detail = self._download_single(
+                                target,
+                                item.url,
+                                video_id=item.video_id,
+                                title=item.title,
+                            )
+                            if outcome == "downloaded":
+                                v_downloaded += 1
+                            elif outcome == "filtered":
+                                v_filtered += 1
+                            elif outcome == "archived":
+                                v_archived += 1
+                            else:
+                                v_failed += 1
+                                summary.errors.append(f"{item.title}: {detail}")
 
-                        self._emit(
-                            "item_done",
-                            target=target,
-                            index=idx,
-                            total=len(candidates),
-                            item=item,
-                            outcome=outcome,
-                            detail=detail,
-                        )
+                            self._emit(
+                                "item_done",
+                                target=target,
+                                index=idx,
+                                total=len(candidates),
+                                item=item,
+                                outcome=outcome,
+                                detail=detail,
+                            )
 
-                        has_more = idx < len(candidates) and (max_dl is None or v_downloaded < max_dl)
-                        if has_more and outcome in {"downloaded", "failed"}:
-                            self._sleep_between_items(target)
+                            has_more = idx < len(candidates) and (max_dl is None or v_downloaded < max_dl)
+                            if has_more and outcome in {"downloaded", "failed"}:
+                                self._sleep_between_items(target)
+                    else:
+                        queue_lock = threading.Lock()
+                        next_pos = 0
+                        in_flight = 0
+
+                        def _worker(worker_idx: int) -> None:
+                            nonlocal next_pos, in_flight, v_downloaded, v_filtered, v_archived, v_failed
+                            if worker_idx > 0:
+                                self._sleeper(worker_idx * 0.5)
+                            while True:
+                                with queue_lock:
+                                    if next_pos >= len(candidates):
+                                        return
+                                    if max_dl is not None and (v_downloaded + in_flight) >= max_dl:
+                                        return
+                                    idx = next_pos + 1
+                                    item = candidates[next_pos]
+                                    next_pos += 1
+                                    in_flight += 1
+
+                                self._emit(
+                                    "item_start",
+                                    target=target,
+                                    index=idx,
+                                    total=len(candidates),
+                                    item=item,
+                                )
+                                try:
+                                    outcome, detail = self._download_single(
+                                        target,
+                                        item.url,
+                                        video_id=item.video_id,
+                                        title=item.title,
+                                    )
+                                finally:
+                                    with queue_lock:
+                                        in_flight -= 1
+
+                                with queue_lock:
+                                    if outcome == "downloaded":
+                                        v_downloaded += 1
+                                    elif outcome == "filtered":
+                                        v_filtered += 1
+                                    elif outcome == "archived":
+                                        v_archived += 1
+                                    else:
+                                        v_failed += 1
+                                        summary.errors.append(f"{item.title}: {detail}")
+                                    has_more = next_pos < len(candidates) and (
+                                        max_dl is None or (v_downloaded + in_flight) < max_dl
+                                    )
+
+                                self._emit(
+                                    "item_done",
+                                    target=target,
+                                    index=idx,
+                                    total=len(candidates),
+                                    item=item,
+                                    outcome=outcome,
+                                    detail=detail,
+                                )
+
+                                if has_more and outcome in {"downloaded", "failed"}:
+                                    self._sleep_between_items(target)
+
+                        with ThreadPoolExecutor(max_workers=workers) as pool:
+                            futures = [pool.submit(_worker, wi) for wi in range(workers)]
+                            for fut in futures:
+                                fut.result()
 
                 summary.discovered += v_discovered
                 summary.already_archived += v_archived

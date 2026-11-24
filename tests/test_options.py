@@ -146,3 +146,20 @@ def test_build_download_opts_bilibili_and_youtube(tmp_path: Path, monkeypatch) -
     y_pp_keys = [pp["key"] for pp in y_opts["postprocessors"]]
     assert "SponsorBlock" in y_pp_keys
     assert "ModifyChapters" in y_pp_keys
+
+
+def test_build_download_opts_sets_temp_dir(tmp_path: Path) -> None:
+    cfg = AppConfig.model_validate(
+        {
+            "paths": {
+                "download_dir": str(tmp_path / "dl"),
+                "state_dir": str(tmp_path / "state"),
+                "temp_dir": str(tmp_path / "fast_tmp"),
+            },
+            "targets": [{"id": "b1", "source": "946974"}],
+        }
+    )
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    opts = build_download_opts(target, archive_path=tmp_path / "b1.txt")
+    assert opts["paths"]["home"] == str((tmp_path / "dl" / "bilibili" / "b1").resolve())
+    assert opts["paths"]["temp"] == str((tmp_path / "fast_tmp").resolve())
