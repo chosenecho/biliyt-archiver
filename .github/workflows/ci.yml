@@ -44,8 +44,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
       - name: Sync dependencies
         run: uv sync --locked
+
+      - name: Verify CLI environment check
+        run: uv run biliyt check
 
       - name: Run pytest
         run: uv run pytest -v

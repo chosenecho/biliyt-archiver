@@ -105,7 +105,11 @@ def test_sync_and_retry_failed_flow(tmp_path: Path) -> None:
     assert state.load_failed("bili_demo") == []
 
 
-def test_cli_init_check_and_status(tmp_path: Path) -> None:
+def test_cli_init_check_and_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "biliyt.doctor._cmd_version",
+        lambda exe, args=None: f"{exe} mock-1.0 (/usr/bin/{exe})",
+    )
     runner = CliRunner()
     cfg_path = tmp_path / "config.yaml"
 
@@ -120,6 +124,21 @@ def test_cli_init_check_and_status(tmp_path: Path) -> None:
     status_res = runner.invoke(app, ["status", "--config", str(cfg_path)])
     assert status_res.exit_code == 0, status_res.output
     assert "bili_example" in status_res.output
+
+
+def test_cli_check_fails_when_ffmpeg_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "biliyt.doctor._cmd_version",
+        lambda exe, args=None: None if exe in {"ffmpeg", "ffprobe"} else f"{exe} mock-1.0",
+    )
+    runner = CliRunner()
+    cfg_path = tmp_path / "config.yaml"
+    init_res = runner.invoke(app, ["init", "--config", str(cfg_path)])
+    assert init_res.exit_code == 0, init_res.output
+
+    check_res = runner.invoke(app, ["check", "--config", str(cfg_path)])
+    assert check_res.exit_code == 1
+    assert "FFmpeg" in check_res.output
 
 
 def test_sync_concurrent_downloads(tmp_path: Path) -> None:
