@@ -8,7 +8,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
+from ..artifacts import Artifact, ArtifactManifest, ArtifactStore, clean_error
+from ..atomic_io import atomic_write_json, atomic_write_text
 from ..config import ResolvedTarget
 from ..platform import Platform, extract_bilibili_uid
 from ..state import FailedRecord, StateStore
@@ -111,13 +114,11 @@ def _favorite_fingerprint(folder: dict[str, Any], title: str) -> str:
 
 
 def _write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, data)
 
 
 def _write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
 
 
 @dataclass
@@ -192,6 +193,41 @@ class BilibiliArchiver:
         from ..db import ArchiveDB
 
         return ArchiveDB(self.state.state_dir / "biliyt.db")
+
+    def _commit_manifest(
+        self, target: ResolvedTarget, *, kind: str, item_id: str, source_url: str,
+        metadata_path: Path, markdown_path: Path, index: Callable[[Any], None],
+        localizer: ImageLocalizer | None = None, image_dir: Path | None = None,
+        context: dict[str, Any] | None = None, extra_artifacts: list[Artifact] | None = None,
+    ) -> None:
+        """Commit files before indexing; index failures remain repairable, saved content."""
+        store = ArtifactStore(target.download_dir, target.id)
+        artifacts = [Artifact("metadata", "complete", store.relative(metadata_path)),
+                     Artifact("markdown", "complete", store.relative(markdown_path))]
+        for image in localizer.last_artifacts if localizer else []:
+            artifacts.append(Artifact(
+                "image", image.status,
+                store.relative((image_dir / Path(image.path).name) if image_dir else (markdown_path.parent / image.path)) if image.path else None,
+                image.source_url, error=image.error,
+            ))
+        artifacts.extend(extra_artifacts or [])
+        coordinates = {"metadata_path": store.relative(metadata_path),
+                       "markdown_path": store.relative(markdown_path), **(context or {})}
+        if image_dir is not None:
+            coordinates["image_dir"] = store.relative(image_dir)
+        manifest = ArtifactManifest(target.id, kind, item_id, source_url, artifacts, context=coordinates)
+        store.save(manifest)
+        try:
+            with self._open_db() as db:
+                index(db)
+        except Exception as exc:
+            manifest.index_status = "failed"
+            manifest.index_error = clean_error(exc)
+            self._emit("ext_index_warning", target=target, module=kind, item_id=item_id,
+                       error=manifest.index_error)
+        else:
+            manifest.index_status = "complete"
+        store.save(manifest)
 
     # ------------------------------------------------------------------
     # Lightweight probe
@@ -274,10 +310,14 @@ class BilibiliArchiver:
 
             try:
                 relation_stat = client.get_relation_stat(uid)
+            except (BilibiliRiskControlError, BilibiliAuthError):
+                raise
             except BilibiliApiError:
                 pass
             try:
                 upstat = client.get_upstat(uid)
+            except (BilibiliRiskControlError, BilibiliAuthError):
+                raise
             except BilibiliApiError:
                 pass
             try:
@@ -287,6 +327,8 @@ class BilibiliArchiver:
                     for col in items_lists.get(key) or []:
                         if isinstance(col, dict):
                             collections.append(col)
+            except (BilibiliRiskControlError, BilibiliAuthError):
+                raise
             except BilibiliApiError:
                 pass
 
@@ -306,16 +348,17 @@ class BilibiliArchiver:
             banner_rel = img_map.get(banner_url)
             fetched_at = _utc_now_iso()
 
-            _write_json(
-                profile_dir / "profile.json",
-                {
-                    "uid": uid,
-                    "fetched_at": fetched_at,
-                    "user_info": user_info,
-                    "relation_stat": relation_stat,
-                    "upstat": upstat,
-                },
-            )
+            snapshot_id = str(uuid4())
+            profile = {
+                "snapshot_id": snapshot_id, "uid": uid, "fetched_at": fetched_at,
+                "user_info": user_info, "relation_stat": relation_stat, "upstat": upstat,
+                "collections": collections,
+                "avatar_relpath": f"profile/{avatar_rel}" if avatar_rel else None,
+                "banner_relpath": f"profile/{banner_rel}" if banner_rel else None,
+            }
+            snapshot_path = profile_dir / "snapshots" / f"{snapshot_id}.json"
+            _write_json(snapshot_path, profile)
+            _write_json(profile_dir / "profile.json", profile)
             _write_json(profile_dir / "collections.json", collections)
             _write_text(
                 profile_dir / "profile.md",
@@ -330,8 +373,18 @@ class BilibiliArchiver:
                     fetched_at=fetched_at,
                 ),
             )
-            with self._open_db() as db:
-                db.upsert_profile(
+            snapshot_markdown = snapshot_path.with_suffix(".md")
+            _write_text(snapshot_markdown, render_profile_markdown(
+                uid=uid, user_info=user_info, relation_stat=relation_stat, upstat=upstat,
+                collections=collections, avatar_rel=f"../{avatar_rel}" if avatar_rel else None,
+                banner_rel=f"../{banner_rel}" if banner_rel else None, fetched_at=fetched_at,
+            ))
+            self._commit_manifest(
+                target, kind="profile", item_id=snapshot_id,
+                source_url=f"https://space.bilibili.com/{uid}/",
+                metadata_path=snapshot_path, markdown_path=snapshot_markdown,
+                localizer=localizer, image_dir=profile_dir / "assets",
+                index=lambda db: db.upsert_profile(
                     target_id=target.id,
                     platform=target.platform.value,
                     uid=uid,
@@ -342,16 +395,18 @@ class BilibiliArchiver:
                     avatar_relpath=f"profile/{avatar_rel}" if avatar_rel else None,
                     banner_relpath=f"profile/{banner_rel}" if banner_rel else None,
                     fetched_at=fetched_at,
-                )
+                    snapshot_id=snapshot_id,
+                ),
+            )
             stats.saved = 1
         except (BilibiliRiskControlError, BilibiliAuthError) as exc:
             stats.failed = 1
-            stats.errors.append(str(exc))
+            stats.errors.append(clean_error(exc))
             self._emit("ext_module_done", target=target, module="profile", stats=stats)
             raise
         except Exception as exc:
             stats.failed = 1
-            stats.errors.append(str(exc))
+            stats.errors.append(clean_error(exc))
 
         self._emit("ext_module_done", target=target, module="profile", stats=stats)
         return stats
@@ -389,14 +444,18 @@ class BilibiliArchiver:
         _write_text(folder / "dynamic.md", md_text)
         rel_folder = folder.relative_to(target.download_dir).as_posix()
         rel_imgs = [f"{rel_folder}/{rel}" for rel in image_map.values()]
-        with self._open_db() as db:
-            db.upsert_dynamic(
+        self._commit_manifest(
+            target, kind="dynamic", item_id=dyn_id, source_url=f"https://t.bilibili.com/{dyn_id}",
+            metadata_path=folder / "dynamic.json", markdown_path=folder / "dynamic.md",
+            localizer=localizer, image_dir=folder / "images",
+            index=lambda db: db.upsert_dynamic(
                 target_id=target.id,
                 item=item,
                 markdown_content=md_text,
                 images_relpaths=rel_imgs,
                 folder_relpath=rel_folder,
-            )
+            ),
+        )
         return folder
 
     def sync_dynamics(
@@ -465,14 +524,14 @@ class BilibiliArchiver:
                     raise
                 except Exception as exc:
                     stats.failed += 1
-                    stats.errors.append(f"dynamic {dyn_id}: {exc}")
+                    stats.errors.append(f"dynamic {dyn_id}: {clean_error(exc)}")
                     self.state.record_failure(
                         target_id=target.id,
                         platform=target.platform.value,
                         url=f"https://t.bilibili.com/{dyn_id}",
                         video_id=dyn_id,
                         title=f"动态 {dyn_id}",
-                        error=str(exc),
+                        error=clean_error(exc),
                         item_type="dynamic",
                         extra={"dynamic_id": dyn_id},
                     )
@@ -518,12 +577,16 @@ class BilibiliArchiver:
                     raw_content = view_data.get("content")
                     if isinstance(raw_content, str) and raw_content.strip():
                         html_text = raw_content
+            except (BilibiliRiskControlError, BilibiliAuthError):
+                raise
             except BilibiliApiError:
                 view_data = None
 
         if opus_detail is None and opus_id:
             try:
                 opus_detail = client.get_opus_detail(opus_id)
+            except (BilibiliRiskControlError, BilibiliAuthError):
+                raise
             except BilibiliApiError:
                 opus_detail = None
 
@@ -532,6 +595,8 @@ class BilibiliArchiver:
                 fetched_html = client.get_article_html(cv_id)
                 if "risk-captcha" not in fetched_html and "v_voucher" not in fetched_html:
                     html_text = fetched_html
+            except (BilibiliRiskControlError, BilibiliAuthError):
+                raise
             except BilibiliApiError:
                 html_text = None
 
@@ -558,6 +623,7 @@ class BilibiliArchiver:
             "meta": meta,
             "view": view_data,
             "opus_detail": opus_detail,
+            "html_text": html_text,
         }
         md_text = render_article_markdown(
             meta=meta,
@@ -569,14 +635,19 @@ class BilibiliArchiver:
         _write_text(folder / "article.md", md_text)
         rel_folder = folder.relative_to(target.download_dir).as_posix()
         rel_imgs = [f"{rel_folder}/{rel}" for rel in image_map.values()]
-        with self._open_db() as db:
-            db.upsert_article(
+        self._commit_manifest(
+            target, kind="article", item_id=f"cv{cv_id}",
+            source_url=f"https://www.bilibili.com/read/cv{cv_id}",
+            metadata_path=folder / "article.json", markdown_path=folder / "article.md",
+            localizer=localizer, image_dir=folder / "images",
+            index=lambda db: db.upsert_article(
                 target_id=target.id,
                 payload=payload,
                 markdown_content=md_text,
                 images_relpaths=rel_imgs,
                 folder_relpath=rel_folder,
-            )
+            ),
+        )
         return folder
 
     def sync_articles(
@@ -646,14 +717,14 @@ class BilibiliArchiver:
                     raise
                 except Exception as exc:
                     stats.failed += 1
-                    stats.errors.append(f"article cv{cv_id}: {exc}")
+                    stats.errors.append(f"article cv{cv_id}: {clean_error(exc)}")
                     self.state.record_failure(
                         target_id=target.id,
                         platform=target.platform.value,
                         url=f"https://www.bilibili.com/read/cv{cv_id}",
                         video_id=key,
                         title=str(meta.get("title") or key),
-                        error=str(exc),
+                        error=clean_error(exc),
                         item_type="article",
                         extra={"cv_id": cv_id, "meta": meta},
                     )
@@ -743,12 +814,16 @@ class BilibiliArchiver:
                     md_path,
                     render_favorite_folder_markdown(folder, medias),
                 )
-                with self._open_db() as db:
-                    db.upsert_favorite_folder(
+                self._commit_manifest(
+                    target, kind="favorite", item_id=str(media_id),
+                    source_url=f"https://www.bilibili.com/medialist/detail/ml{media_id}",
+                    metadata_path=json_path, markdown_path=md_path,
+                    index=lambda db: db.upsert_favorite_folder(
                         target_id=target.id,
                         folder=folder,
                         medias=medias,
-                    )
+                    ),
+                )
                 self.state.append_namespace_archive(
                     target.id,
                     "favorites",
@@ -762,7 +837,7 @@ class BilibiliArchiver:
                 raise
             except Exception as exc:
                 stats.failed += 1
-                stats.errors.append(f"favorite {media_id}: {exc}")
+                stats.errors.append(f"favorite {media_id}: {clean_error(exc)}")
 
         if index_entries and (stats.saved > 0 or not (fav_dir / "index.md").exists()):
             _write_text(fav_dir / "index.md", render_favorites_index_markdown(uid, index_entries))
@@ -827,6 +902,8 @@ class BilibiliArchiver:
                 if len(batch) < ps:
                     break
                 pn += 1
+        except (BilibiliRiskControlError, BilibiliAuthError):
+            raise
         except BilibiliApiError:
             return reply
 
@@ -1133,8 +1210,12 @@ class BilibiliArchiver:
                 carrier_kind_singular = {"videos": "video", "dynamics": "dynamic", "articles": "article"}.get(
                     carrier.kind, carrier.kind
                 )
-                with self._open_db() as db:
-                    db.upsert_comments(
+                self._commit_manifest(
+                    target, kind="comment", item_id=carrier.archive_key, source_url=carrier.source_url,
+                    metadata_path=carrier.json_path, markdown_path=carrier.md_path,
+                    context={"carrier_kind": carrier_kind_singular, "oid": carrier.oid,
+                             "rtype": carrier.rtype, "title": carrier.title},
+                    index=lambda db: db.upsert_comments(
                         target_id=target.id,
                         carrier_kind=carrier_kind_singular,
                         oid=carrier.oid,
@@ -1143,7 +1224,8 @@ class BilibiliArchiver:
                         source_url=carrier.source_url,
                         bundle=bundle,
                         up_uid=uid,
-                    )
+                    ),
+                )
                 fetched_iso = _utc_now_iso()
                 self.state.append_namespace_archive(
                     target.id,
@@ -1159,22 +1241,22 @@ class BilibiliArchiver:
                 raise
             except Exception as exc:
                 stats.failed += 1
-                stats.errors.append(f"comment {carrier.archive_key}: {exc}")
+                stats.errors.append(f"comment {carrier.archive_key}: {clean_error(exc)}")
                 self.state.record_failure(
                     target_id=target.id,
                     platform=target.platform.value,
                     url=carrier.source_url,
                     video_id=carrier.archive_key,
                     title=f"评论: {carrier.title}",
-                    error=str(exc),
+                    error=clean_error(exc),
                     item_type="comment",
                     extra={
                         "carrier_kind": carrier.kind,
                         "oid": carrier.oid,
                         "rtype": carrier.rtype,
                         "title": carrier.title,
-                        "json_path": str(carrier.json_path),
-                        "md_path": str(carrier.md_path),
+                        "json_path": ArtifactStore(target.download_dir, target.id).relative(carrier.json_path),
+                        "md_path": ArtifactStore(target.download_dir, target.id).relative(carrier.md_path),
                         "archive_key": carrier.archive_key,
                     },
                 )
@@ -1285,8 +1367,17 @@ class BilibiliArchiver:
                     oid = str(extra.get("oid") or "")
                     rtype = int(extra.get("rtype") or 1)
                     title = str(extra.get("title") or record.title or oid)
-                    json_path = Path(str(extra.get("json_path") or ""))
-                    md_path = Path(str(extra.get("md_path") or ""))
+                    store = ArtifactStore(target.download_dir, target.id)
+                    def retry_path(key: str) -> Path:
+                        raw = str(extra.get(key) or "")
+                        if not raw:
+                            raise ValueError("Missing comment retry path")
+                        path = Path(raw)
+                        if path.is_absolute():
+                            return store.resolve(store.relative(path))
+                        return store.resolve(raw)
+                    json_path = retry_path("json_path")
+                    md_path = retry_path("md_path")
                     archive_key = str(extra.get("archive_key") or record.video_id or "")
                     if not oid or not str(json_path):
                         return "failed", "失败记录缺少评论重试元数据"
@@ -1323,8 +1414,12 @@ class BilibiliArchiver:
                         "articles": "article",
                         "article": "article",
                     }.get(raw_kind, "video" if rtype == 1 else ("article" if rtype == 12 else "dynamic"))
-                    with self._open_db() as db:
-                        db.upsert_comments(
+                    self._commit_manifest(
+                        target, kind="comment", item_id=archive_key or f"{carrier_kind_singular}:{rtype}:{oid}",
+                        source_url=record.url, metadata_path=json_path, markdown_path=md_path,
+                        context={"carrier_kind": carrier_kind_singular, "oid": oid,
+                                 "rtype": rtype, "title": title},
+                        index=lambda db: db.upsert_comments(
                             target_id=target.id,
                             carrier_kind=carrier_kind_singular,
                             oid=oid,
@@ -1333,7 +1428,8 @@ class BilibiliArchiver:
                             source_url=record.url,
                             bundle=bundle,
                             up_uid=uid,
-                        )
+                        ),
+                    )
                     if archive_key:
                         self.state.append_namespace_archive(
                             target.id,
@@ -1376,6 +1472,8 @@ class BilibiliArchiver:
                     return "downloaded", ""
 
                 return "failed", f"不支持的失败重试类型: {record.item_type}"
+        except (BilibiliRiskControlError, BilibiliAuthError):
+            raise
         except Exception as exc:
             self.state.record_failure(
                 target_id=target.id,
@@ -1383,8 +1481,8 @@ class BilibiliArchiver:
                 url=record.url,
                 video_id=record.video_id,
                 title=record.title,
-                error=str(exc),
+                error=clean_error(exc),
                 item_type=record.item_type,
                 extra=dict(record.extra or {}),
             )
-            return "failed", str(exc)
+            return "failed", clean_error(exc)

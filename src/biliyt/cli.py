@@ -18,12 +18,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__
+from .artifacts import ArtifactStore, clean_error
 from .config import AppConfig, ResolvedTarget, load_config, resolve_target
-from .db import ArchiveDB, rebuild_target_from_disk
+from .db import ArchiveDB, RebuildError, rebuild_database
 from .doctor import run_environment_checks
 from .downloader import SyncEngine, build_run_report
 from .platform import Platform
-from .state import StateStore, SyncLockError
+from .state import StateStore, SyncLockError, TargetRunSummary
 
 
 def _configure_utf8_stdio() -> None:
@@ -325,6 +326,8 @@ def sync(
                 console.print(f"      [red]✗ 重试仍失败: {payload['detail']}[/red]")
         elif event == "target_error":
             console.print(f"    [red]✗ 目标解析失败: {payload['error']}[/red]")
+        elif event == "ext_index_warning":
+            console.print(f"      [yellow]索引待修复: {rich_escape(str(payload['error']))}[/yellow]")
         elif event == "ext_module_start":
             console.print(f"    [cyan]• 同步模块 \\[{payload['module']}][/cyan] ...")
         elif event == "ext_module_done":
@@ -374,8 +377,10 @@ def sync(
                             finished_at=report.finished_at,
                             summary_dict=asdict(report),
                         )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report.warnings.append(f"运行历史写入索引失败: {clean_error(exc)}")
+                    state.save_report(report)
+                    console.print(f"[yellow]{rich_escape(report.warnings[-1])}[/yellow]")
             else:
                 report_path = None
     except SyncLockError as exc:
@@ -390,10 +395,15 @@ def sync(
     table.add_column("跳过", justify="right", style="yellow")
     table.add_column("新下载", justify="right", style="green")
     table.add_column("失败", justify="right", style="red")
+    table.add_column("部分完成", justify="right", style="yellow")
+    table.add_column("待索引", justify="right", style="yellow")
+    table.add_column("待修复", justify="right", style="yellow")
 
     total_failed = 0
+    total_pending = 0
     for s in summaries:
         total_failed += s.failed
+        total_pending += s.pending_repair
         table.add_row(
             s.target_id,
             s.platform,
@@ -402,6 +412,9 @@ def sync(
             str(s.filtered_out),
             str(s.downloaded),
             str(s.failed),
+            str(s.partial),
+            str(s.index_failed),
+            str(s.pending_repair),
         )
 
     console.print()
@@ -431,7 +444,10 @@ def sync(
     if report_path:
         console.print(f"[dim]运行报告已保存: {report_path}[/dim]")
     if total_failed > 0:
-        console.print("[yellow]提示: 失败条目已记入 state/failed.jsonl，可用 `biliyt sync --retry-failed` 重试。[/yellow]")
+        console.print("[yellow]抓取失败可用 `biliyt sync --retry-failed` 重试。[/yellow]")
+    if total_pending > 0:
+        console.print("[yellow]附件或索引待补齐，可用 `biliyt repair` 预览；以上完整度计数可能重叠。[/yellow]")
+    if total_failed > 0 or total_pending > 0 or (not dry_run and report.warnings):
         raise typer.Exit(code=2)
 
 
@@ -460,6 +476,7 @@ def status(
     table.add_column("视频", justify="right", style="green", no_wrap=True)
     table.add_column("动/专/评", justify="right", style="green", no_wrap=True)
     table.add_column("失败", justify="right", style="red", no_wrap=True)
+    table.add_column("部分/索引/修复", justify="right", style="yellow", no_wrap=True)
     table.add_column("输出目录", style="dim")
 
     for t in targets:
@@ -468,6 +485,15 @@ def status(
         art_n = state.count_namespace_archive(t.id, "articles")
         cmt_n = state.count_namespace_archive(t.id, "comments")
         failed_n = len(state.load_failed(t.id))
+        try:
+            manifest_errors: list[str] = []
+            completeness = ArtifactStore(t.download_dir, t.id).stats(errors=manifest_errors)
+            complete_label = f"{completeness['partial']}/{completeness['index_failed']}/{completeness['pending_repair']}"
+            for error in manifest_errors:
+                console.print(f"[yellow]{rich_escape(t.id)}: {rich_escape(error)}[/yellow]")
+        except Exception as exc:
+            complete_label = "清单异常"
+            console.print(f"[yellow]{rich_escape(t.id)}: {rich_escape(clean_error(exc))}[/yellow]")
         table.add_row(
             t.id,
             t.platform.value,
@@ -475,10 +501,12 @@ def status(
             str(archived_n),
             f"{dyn_n}/{art_n}/{cmt_n}",
             str(failed_n),
+            complete_label,
             str(t.download_dir),
         )
 
     console.print(table)
+    console.print("[dim]部分完成 / 待索引 / 待修复为条目数，可重叠；旧归档的未知附件不会自动补抓。[/dim]")
 
     last = state.load_last_report()
     if last:
@@ -488,6 +516,102 @@ def status(
         )
     else:
         console.print("[dim]尚无同步运行记录。[/dim]")
+
+
+@app.command()
+def repair(
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="配置文件路径"),
+    target: Optional[list[str]] = typer.Option(None, "--target", "-t", help="仅修复指定目标（可多次传入）"),
+    only: Optional[str] = typer.Option(None, "--only", help="逗号分隔：index,metadata,subtitles,images"),
+    apply: bool = typer.Option(False, "--apply", help="执行修复；默认只预览，不写入、不联网"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", min=1, help="每目标最多处理条目数"),
+) -> None:
+    """预览或补齐已归档条目的附件、元数据和索引。"""
+    from .recovery import build_repair_plan, execute_repair_plan
+
+    wanted = {part.strip() for part in only.split(",") if part.strip()} if only else None
+    if wanted is not None and (not wanted or wanted - {"index", "metadata", "subtitles", "images"}):
+        console.print("[red]--only 支持 index,metadata,subtitles,images[/red]")
+        raise typer.Exit(code=1)
+    try:
+        _, _, targets = _load_and_select_targets(config, target, include_disabled=bool(target))
+    except Exception as exc:
+        console.print(f"[red]{rich_escape(clean_error(exc))}[/red]")
+        raise typer.Exit(code=1)
+    if not targets:
+        console.print("[yellow]没有可修复的目标。[/yellow]")
+        return
+    state = StateStore(targets[0].state_dir)
+    started = datetime.now(timezone.utc)
+    failed = 0
+    summaries = []
+    try:
+        with state.acquire_sync_lock() if apply else nullcontext():
+            for t in targets:
+                plan = build_repair_plan(t, state, only=wanted, limit=limit)
+                table = Table(title=f"{'修复计划' if not apply else '执行修复'}: {t.id}")
+                table.add_column("条目")
+                table.add_column("操作")
+                table.add_column("联网")
+                table.add_column("原因")
+                for job in plan.jobs:
+                    table.add_row(job.item_id, job.action, "是" if job.requires_network else "否", rich_escape(job.reason))
+                console.print(table)
+                deferred = [m for m in plan.manifests if any(
+                    a.kind == "subtitle_embed" and a.status in {"pending", "failed"} for a in m.artifacts
+                )] if wanted is None or "subtitles" in wanted else []
+                for manifest in deferred:
+                    console.print(f"[yellow]{rich_escape(manifest.item_id)}: 嵌入字幕仍待重封装，当前只补独立字幕文件。[/yellow]")
+                if apply:
+                    failed += len(deferred)
+                for error in plan.errors:
+                    console.print(f"[yellow]{rich_escape(clean_error(error))}[/yellow]")
+                if not apply:
+                    failed += len(plan.errors)
+                    continue
+                result = execute_repair_plan(plan, t, state)
+                failed += result.failed
+                summary = TargetRunSummary(
+                    t.id, t.name, t.platform.value, t.url,
+                    downloaded=result.completed, failed=result.failed,
+                    errors=[clean_error(e) for e in result.errors],
+                    warnings=[f"{m.item_id}: 嵌入字幕仍待重封装" for m in deferred],
+                )
+                try:
+                    stats = ArtifactStore(t.download_dir, t.id).stats()
+                    summary.partial = stats["partial"]
+                    summary.index_failed = stats["index_failed"]
+                    summary.pending_repair = stats["pending_repair"]
+                except Exception as exc:
+                    summary.errors.append(clean_error(exc))
+                    summary.failed += 1
+                    failed += 1
+                summaries.append(summary)
+                console.print(f"完成 {result.completed} | 失败 {result.failed} | 跳过 {result.skipped}")
+                for error in result.errors:
+                    console.print(f"[yellow]{rich_escape(clean_error(error))}[/yellow]")
+            if apply:
+                report = build_run_report("repair", started, summaries)
+                path = state.save_report(report)
+                try:
+                    with ArchiveDB(state.state_dir / "biliyt.db") as db:
+                        db.record_sync_run(mode=report.mode, started_at=report.started_at,
+                                           finished_at=report.finished_at, summary_dict=asdict(report))
+                except Exception as exc:
+                    report.warnings.append(clean_error(exc))
+                    state.save_report(report)
+                    failed += 1
+                console.print(f"[dim]运行报告: {path}[/dim]")
+    except SyncLockError as exc:
+        console.print(f"[yellow]{rich_escape(str(exc))}[/yellow]")
+        raise typer.Exit(code=3)
+    except Exception as exc:
+        console.print(f"[red]{rich_escape(clean_error(exc))}[/red]")
+        raise typer.Exit(code=2)
+    if not apply:
+        console.print("[dim]以上为只读预览；使用 --apply 执行。[/dim]")
+    if failed:
+        raise typer.Exit(code=2)
 
 
 def _resolve_state_dir(config: Path) -> tuple[AppConfig, Path, Path]:
@@ -544,9 +668,12 @@ def db_stats(
 def db_rebuild(
     config: Path = typer.Option(Path("config.yaml"), "--config", "-c", help="配置文件路径"),
     target: Optional[list[str]] = typer.Option(None, "--target", "-t", help="仅重建指定 target id（可多次传入）"),
-    reset: bool = typer.Option(False, "--reset", help="先清空现有数据库再从 downloads/ 全量重建"),
+    reset: bool = typer.Option(False, "--reset", help="从 downloads/ 构建临时数据库，验证成功后替换全库（不可与 --target 同用）"),
 ) -> None:
-    """从本地 downloads/ 已有文件无损重建 SQLite 归档与全文索引（零网络请求）。"""
+    """按现存归档、快照和运行报告离线重建 SQLite；已丢失的历史无法还原。"""
+    if reset and target:
+        console.print("[red]参数错误: --reset 为全库重建，不可与 --target 同用。[/red]")
+        raise typer.Exit(code=1)
     try:
         cfg, base_dir, targets = _load_and_select_targets(
             config, target_ids=target, include_disabled=True
@@ -571,21 +698,28 @@ def db_rebuild(
     table.add_column("收藏夹", justify="right")
     table.add_column("评论", justify="right", style="green")
 
-    with ArchiveDB(db_path) as db:
-        if reset:
-            db.reset()
-        for t in targets:
-            c = rebuild_target_from_disk(db, t)
-            table.add_row(
-                t.id,
-                str(c["profiles"]),
-                str(c["videos"]),
-                str(c["dynamics"]),
-                str(c["articles"]),
-                str(c["favorites"]),
-                str(c["comments"]),
-            )
-        st = db.stats()
+    try:
+        with StateStore(state_dir).acquire_sync_lock():
+            results = rebuild_database(db_path, targets, reset=reset)
+            with ArchiveDB(db_path) as db:
+                st = db.stats()
+    except SyncLockError as exc:
+        console.print(f"[yellow]另一个写入操作正在进行: {rich_escape(str(exc))}[/yellow]")
+        raise typer.Exit(code=3)
+    except RebuildError as exc:
+        console.print(f"[red]{rich_escape(str(exc))}[/red]")
+        raise typer.Exit(code=2)
+    for t in targets:
+        c = results[t.id]
+        table.add_row(
+            t.id,
+            str(c["profiles"]),
+            str(c["videos"]),
+            str(c["dynamics"]),
+            str(c["articles"]),
+            str(c["favorites"]),
+            str(c["comments"]),
+        )
 
     console.print(table)
     console.print(

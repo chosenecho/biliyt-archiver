@@ -1,9 +1,19 @@
-# PDR：B 站 UP 主全量内容离线归档系统（biliyt v0.2）
+# 历史 PDR：B 站 UP 主全量内容离线归档系统
 
-- **文档状态**：Draft v1.0（待评审确认后进入开发）
+- **文档状态**：历史 Draft v1.0，保留原始方案供设计溯源；原规划名“v0.2”不代表当前发布版本
 - **所属项目**：`biliyt`（`chosenecho/biliyt-archiver`）
 - **基线版本**：`v0.1.0`（commit `6c469e9`）
-- **适用平台**：Bilibili（保持 YouTube 现有能力与配置 100% 向下兼容）
+- **适用平台**：Bilibili（历史目标为保持 YouTube 工作流兼容）
+
+## 当前实现说明（v0.1.0 / Unreleased）
+
+主页、动态、专栏、精选评论、公开收藏夹与相应配置和 CLI 已在当前代码落地。以下正文保留当时的目录规划、里程碑与验收设想，不逐项充当现状说明；例如配置正式字段为 `archive`，当前命令和默认值以[配置详解](configuration.md)、[运维 SOP](bilibili-full-archive-sop.md) 和 CLI 帮助为准。
+
+Unreleased 可靠性更新新增逐条 `.biliyt/manifests/` 产物清单、`profile/snapshots/` 主页历史和带 `run_id` 的报告。`repair` 默认只读预览，通过 `--apply` 执行，支持 `--only index,metadata,subtitles,images` 和每目标按内容条目计数的 `--limit`。旧归档的未知附件不自动联网补抓；字幕初版仅补独立文件，不重新封装已有视频。`status` 的部分完成、待索引、待修复计数可重叠。
+
+数据库 v2 逐版迁移，以 `snapshot_id` / `run_id` 幂等导入历史。`db rebuild --target` 增量导入，`--reset` 是带备份、临时库校验和替换的全库操作，两参数禁止组合；同步、修复执行、重建共用写锁。本轮不新增必填配置或运行时依赖，但未知配置字段开始报错。
+
+恢复需保留 `downloads/`（含隐藏清单和主页历史）、`state/reports/`，另行保留 `state/archives/`、失败队列与配置。旧目录只剩最新主页时，已丢历史不在现存文件可恢复的信息内。实际备份与重建流程见 [SQLite SOP](sqlite-storage-sop.md)。
 
 ---
 

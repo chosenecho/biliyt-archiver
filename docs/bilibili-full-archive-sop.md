@@ -1,6 +1,6 @@
 # SOP：B 站 UP 主全量内容归档开发、建档与日常运维手册
 
-本 SOP 配套 [bilibili-full-archive-pdr.md](bilibili-full-archive-pdr.md) 使用，覆盖 **开发落地 → 首次全量建档 → 日常增量运行 → 异常风控处置 → 定期维护** 全生命周期。
+本 SOP 适用于当前 `v0.1.0` 与 Unreleased 可靠性更新，覆盖 **开发落地 → 首次全量建档 → 日常增量运行 → 异常风控处置 → 定期维护**。配套 [PDR](bilibili-full-archive-pdr.md) 保留历史设计，实际配置与命令以本 SOP、[配置详解](configuration.md) 和 CLI 帮助为准；本次更新不新增必填配置或运行时依赖。
 
 ---
 
@@ -94,11 +94,22 @@ biliyt sync --target <target_id> --only comments --full
 - 如目标内容总数超过 200 条，建议分批按 `--full --limit 30` 执行，避免评论接口连续高密度翻页触发 `-352`。
 
 ### Step 3.5 建档收尾与失败补漏
+
 ```bash
 biliyt status
-# 若失败队列 > 0，等待 5~10 分钟后执行精准补漏
+# 抓取失败进入失败队列，排除接口问题后重试
 biliyt sync --target <target_id> --retry-failed
+# 已保存但附件或索引有缺项时，先只读预览
+biliyt repair --target <target_id>
+# 仅重试本地索引，无需重下媒体
+biliyt repair --target <target_id> --only index --apply
+# 按条目分批补齐元数据、字幕与图片
+biliyt repair --target <target_id> --only metadata,subtitles,images --limit 10 --apply
 ```
+
+`repair` 默认不联网、不写文件或数据库，添加 `--apply` 才执行；`--only` 支持逗号组合 `index,metadata,subtitles,images`，`--limit` 按每目标的不同内容条目计数。补图成功后重新渲染 Markdown 并刷新索引。初版字幕修复只补独立字幕文件，已有视频的嵌入字幕需求保留待处理，不做重封装。
+
+旧归档无法判断当时是否请求过的附件标为 `unknown`，不会自动批量联网补抓；显式关闭及平台明确无此附件也不循环修复。媒体保存成功仍可同时存在附件缺项或待索引，`status` 的部分完成 / 待索引 / 待修复计数可重叠，勿相加计算总条数。
 
 ---
 
@@ -136,7 +147,8 @@ biliyt status
 检查：
 1. 最近一次运行报告（`state/last_run.json`）是否存在 `errors`。
 2. `state/failed.jsonl` 待重试条数是否为 `0`；若不为 `0`，先查明原因再跑 `--retry-failed`。
-3. 硬盘剩余空间是否充足。
+3. `status` 的部分完成 / 待索引 / 待修复是否持续增加，必要时先执行 `repair` 查看计划。
+4. 硬盘剩余空间是否充足。运行报告包含稳定 `run_id`、缺项和索引失败信息，同秒执行的报告也分别保存。
 
 ---
 
@@ -146,7 +158,7 @@ biliyt status
 | :--- | :--- | :--- | :--- |
 | **B 站返回 `-352` / `-412` 或 HTTP `412`** | 短时间请求过密触发风控熔断 | 1. **立即停止重跑**，等待 `15–60 分钟`<br>2. 在浏览器打开 B 站主页确认是否弹验证码，如有则手动完成验证<br>3. 适当调大 `api_sleep_min/max`（如 `3.0–6.0s`）<br>4. 若需要，重新导出最新 `cookies/bilibili.txt` | `biliyt check` 通过后执行 `biliyt sync --retry-failed` |
 | **返回 `-101` / `-111` 或视频降为 360P / 无字幕** | `SESSDATA` 登录态过期或失效 | 1. 在浏览器重新登录 B 站<br>2. 用 *Get cookies.txt LOCALLY* 重新导出并覆盖 `cookies/bilibili.txt` | `biliyt check` → `biliyt sync --retry-failed` |
-| **单条动态图片 `403` 或下载失败** | 缺少 `Referer` 或原图链接已失效 | 确认客户端携带 `Referer: https://www.bilibili.com/`；若原图已 404，保留 `.json` 原始 URL 记录不阻塞整批任务 | `biliyt sync --retry-failed` |
+| **单条动态图片 `403` 或下载失败** | 缺少 `Referer` 或原图链接已失效 | 检查原始内容是否仍可访问；正文已保存时检查产物清单中的图片缺项，单图失败不代表整条内容丢失 | `biliyt repair --target <target_id> --only images` 预览后加 `--apply` |
 | **转发动态显示原动态已删除** | 原作者删除或隐藏了被转发内容 | 属于平台侧正常现象，渲染器在 Markdown 中标记「原动态已不可见」并保留外层转发文字 | 无需处理 |
 | **评论区缺失或返回空** | UP 主关闭了评论区 / 精选评论模式 / 接口限流 | 检查原页面评论区状态；若为限流则按 `-352` 处置 | 限流恢复后用 `--retry-failed` 补抓 |
 | **下载中途断电 / 手动 Ctrl+C 中断** | 进程异常退出 | 已完成条目的归档记录已即时落盘；清理可能残留的 `.part` 临时文件（`yt-dlp` 会自动续传） | 直接重新执行 `biliyt sync` |
@@ -161,5 +173,7 @@ biliyt status
    uv lock --upgrade-package yt-dlp
    uv sync
    ```
-3. **归档状态备份**：`state/archives/` 与 `config.yaml` 体积很小（KB 级），建议定期备份到网盘或另一块硬盘——只要保留了 `state/archives/`，即使迁移机器也不会重复下载历史数据。
-4. **隐私与合规**：严禁将 `cookies/`、`config.yaml` 上传到任何公开代码仓库；归档内容仅限个人离线收藏与研究备份。
+3. **内容、历史与工作流备份**：同时保留 `downloads/`、`state/` 与配置；备份工具须包含隐藏的 `.biliyt/manifests/`、`profile/snapshots/`、`state/reports/`、`state/archives/` 和失败队列。主页每次采集先追加带稳定 `snapshot_id` 的历史快照，再更新最新主页。仅保留归档文本只能帮助跳过已下载条目，不能恢复正文、附件或历史。
+4. **数据库恢复**：`biliyt db rebuild --target <target_id>` 增量导入现存内容；全库重建用 `biliyt db rebuild --reset`，两参数禁止组合。全库先创建 SQLite backup 并导出原库独有历史，再构建临时库，导入与完整性、计数检查成功后才替换。坏文件、Windows 连接占用或替换失败时保留原库，按错误中的备份路径处理。数据库 v2 逐版迁移，按 `snapshot_id` / `run_id` 幂等导入；旧目录已丢失的历史不会从最新主页还原。操作细节见 [SQLite SOP](sqlite-storage-sop.md)。
+5. **写入互斥**：同步、修复执行和重建共用进程写锁；看到“另一个写入操作正在进行”时等待当前操作结束。锁冲突退出码为 `3`；部分失败为 `2`，配置或参数错误为 `1`。
+6. **隐私与合规**：严禁将 `cookies/`、`config.yaml` 上传到任何公开代码仓库；归档内容仅限个人离线收藏与研究备份。

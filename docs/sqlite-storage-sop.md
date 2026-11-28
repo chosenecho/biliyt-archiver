@@ -11,12 +11,14 @@
 | 层级 | 路径 | 存放内容 | 设计约束 |
 | :--- | :--- | :--- | :--- |
 | **文件层（Source of Truth for Media）** | `downloads/` | `.mp4` 视频、`.jpg/.png` 封面与原图、`.srt` 字幕原文件、`.danmaku.xml`、`.md` 离线可读稿、原始 `.json` | **严禁**将视频/图片二进制作为 BLOB 存入 SQLite；文件层保证脱离程序也能直接浏览播放 |
-| **数据库层（Structured Index & Search）** | `state/biliyt.db` | UP 主档案与历史快照、视频元数据+字幕纯文本、动态、专栏、精选评论、收藏夹清单、同步历史、FTS5 跨模态倒排索引 | 所有路径均存**相对 `download_dir` 的 POSIX 路径**，迁移目录不失效；支持从 `downloads/` 随时无损重建 |
+| **数据库层（Structured Index & Search）** | `state/biliyt.db` | UP 主档案与历史快照、视频元数据+字幕纯文本、动态、专栏、精选评论、收藏夹清单、同步历史、FTS5 跨模态倒排索引 | 所有路径均存**相对 `download_dir` 的 POSIX 路径**，迁移目录不失效；内容与历史根据 `downloads/` 和 `state/reports/` 中现存文件重建 |
 | **归档兼容层** | `state/archives/*.txt` | 保留给 `yt-dlp` 自身的 `--download-archive` 与轻量幂等校验 | 过渡期继续保留，与 SQLite 同步更新，零破坏现有逻辑 |
 
 ---
 
-## 2. 数据库 Schema 规范（v1）
+## 2. 数据库 Schema 规范（v2）
+
+现有业务表保留，数据库按 `schema_migrations` 中尚未应用的版本逐版迁移。v2 为 `profile_snapshots` 增加可空 `snapshot_id`，为 `sync_runs` 增加可空 `run_id`，并建立唯一索引；升级时为旧记录补稳定标识并去除完全相同的重复历史。新主页快照和运行报告携带稳定 ID，重复导入不增加同一份历史记录；相同时间的不同记录仍分别保留。下方列出基础字段，v2 新增字段见相应条目。
 
 ### 2.1 连接与运行参数（必须强制开启）
 每次打开 `biliyt.db` 必须执行：
@@ -33,7 +35,7 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
    - `version INTEGER PRIMARY KEY`, `applied_at TEXT NOT NULL`, `description TEXT`
 2. **`profiles`（UP 主最新档案）& `profile_snapshots`（历史趋势快照）**
    - `profiles`: `target_id TEXT PRIMARY KEY`, `platform TEXT`, `uid TEXT`, `name TEXT`, `sign TEXT`, `level INTEGER`, `official_title TEXT`, `follower INTEGER`, `following INTEGER`, `archive_views INTEGER`, `likes INTEGER`, `avatar_relpath TEXT`, `banner_relpath TEXT`, `collections_json TEXT`, `raw_json TEXT`, `updated_at TEXT`
-   - `profile_snapshots`: `id INTEGER PRIMARY KEY AUTOINCREMENT`, `target_id TEXT`, `fetched_at TEXT`, `follower INTEGER`, `following INTEGER`, `archive_views INTEGER`, `likes INTEGER`
+   - `profile_snapshots`: `id INTEGER PRIMARY KEY AUTOINCREMENT`, `target_id TEXT`, `fetched_at TEXT`, `follower INTEGER`, `following INTEGER`, `archive_views INTEGER`, `likes INTEGER`，v2 增加 `snapshot_id TEXT`（唯一索引）
 3. **`videos`（投稿视频 + 字幕文本）**
    - `id INTEGER PRIMARY KEY AUTOINCREMENT`
    - `target_id TEXT NOT NULL`, `platform TEXT NOT NULL`, `video_id TEXT NOT NULL`（B 站 BV / YouTube ID）, `aid TEXT`（B 站数字 AV 号）
@@ -66,7 +68,7 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
    - `favorites`: `target_id TEXT`, `media_id TEXT`, `title TEXT`, `media_count INTEGER`, `updated_at TEXT`, `UNIQUE(target_id, media_id)`
    - `favorite_items`: `target_id TEXT`, `media_id TEXT`, `bvid TEXT`, `title TEXT`, `upper_name TEXT`, `duration INTEGER`, `fav_time TEXT`, `url TEXT`, `UNIQUE(target_id, media_id, bvid)`
 8. **`sync_runs`（同步运行历史）**
-   - `id INTEGER PRIMARY KEY AUTOINCREMENT`, `mode TEXT`, `started_at TEXT`, `finished_at TEXT`, `summary_json TEXT`
+   - `id INTEGER PRIMARY KEY AUTOINCREMENT`, `mode TEXT`, `started_at TEXT`, `finished_at TEXT`, `summary_json TEXT`，v2 增加 `run_id TEXT`（唯一索引）
 9. **`search_fts`（跨模态全文检索虚表）**
    - 使用 SQLite FTS5 `trigram` 分词器（原生支持任意 ≥ 3 字符的中文子串精确匹配，无需外装中文分词库）：
      ```sql
@@ -87,7 +89,7 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
 
 ## 3. 开发落地 SOP（Dev SOP）
 
-按 4 个小里程碑依次落地，每步必须通过 `pytest` 回归：
+以下 M1–M4 保留早期实施分工，已落地功能以当前源码及本文运维章节为准。后续变更须通过离线 `pytest` 回归：
 
 ### M1：数据层底座 (`src/biliyt/db.py`)
 1. 实现 `ArchiveDB(db_path: Path)`：
@@ -122,7 +124,9 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
 ### M4：CLI 命令与文档
 在 `cli.py` 新增两类命令：
 - `biliyt db stats`：展示数据库路径、体积及各表记录数
-- `biliyt db rebuild [--target <id>] [--reset]`：从本地 `downloads/` 全量重建（`--reset` 先清空重来）
+- `biliyt db rebuild [--target <id>]`：从本地归档增量导入，不清空其他目标。
+- `biliyt db rebuild --reset`：全库临时重建并校验后替换，不能与 `--target` 组合。
+- `biliyt repair [--target <id>] [--only index,metadata,subtitles,images] [--limit N] [--apply]`：默认只读预览，显式执行时补齐缺项并重试索引。
 - `biliyt search <query> [-t <target>] [-k video,subtitle,dynamic,article,comment] [-n 20]`：终端 Rich 表格/片段展示命中结果与原链接
 
 ---
@@ -131,7 +135,7 @@ PRAGMA busy_timeout = 5000;         -- 5 秒锁等待，防止并发任务瞬间
 
 ### Step 4.1 已有下载目录一键入库（首次启用）
 ```bash
-# 1) 从现有 downloads/ 无损重建数据库（零网络请求）
+# 1) 从现有 downloads/ 与 state/reports/ 离线导入数据库
 biliyt db rebuild
 
 # 2) 查看入库统计
@@ -181,24 +185,48 @@ biliyt sync
 ### 5.1 安全热备份（严禁运行中直接复制 `.db` 单文件）
 WAL 模式下数据可能分散在 `biliyt.db`、`biliyt.db-wal`、`biliyt.db-shm` 三个文件中。备份必须使用一致性快照：
 ```powershell
-# 推荐：使用 SQLite 在线备份接口生成单一紧凑副本
-python -c "import sqlite3; c=sqlite3.connect('state/biliyt.db'); c.execute(\"VACUUM INTO 'state/biliyt_backup.db'\"); c.close()"
+# 推荐：使用 SQLite 在线备份接口生成一致性副本
+python -c "import sqlite3; source=sqlite3.connect('state/biliyt.db'); backup=sqlite3.connect('state/biliyt_backup.db'); source.backup(backup); backup.close(); source.close()"
 ```
-建议每月备份一次 `state/biliyt_backup.db` + `config.yaml` + `state/archives/`。
+建议按归档更新频率备份数据库快照、`config.yaml`、整个 `downloads/` 和 `state/`。文件备份要包含隐藏的 `.biliyt/manifests/`、`profile/snapshots/`，以及 `state/reports/`、`state/archives/`、`state/failed.jsonl`。`downloads/` 保存内容与主页历史，`reports/` 保存带 `run_id` 的运行历史；归档文本和失败队列是独立的工作流状态，数据库重建不会替它们恢复。
 
-### 5.2 数据库损坏或 Schema 异常的一键恢复
-因为文件层保留了完整的原始 `.json` 与 `.srt`，SQLite 属于**可完全再生资产**：
+### 5.2 从本地文件重建与恢复
+
 ```bash
-# 重置并从 downloads/ 全量无损重建
+# 单目标增量导入，不清空其他目标
+biliyt db rebuild --target bili_example
+
+# 全库重建：不与 --target 组合
 biliyt db rebuild --reset
 biliyt db stats
 ```
 
-### 5.3 定期空间整理（每季度或大批量建档后执行 1 次）
+`sync`、`repair --apply` 和 `db rebuild` 共用 `state/.sync.lock` 写锁；出现“另一个写入操作正在进行”时等待当前操作结束，锁冲突退出码为 `3`。`--target --reset` 在写库前报参数错误，退出码为 `1`。
+
+全库重建先通过 SQLite backup 为现存原库创建同目录 `biliyt.db.backup-*.db` 副本，将旧库独有的主页与运行历史导出至持久化历史文件，再在数据库同目录构建临时库。现存主页历史、最新主页、视频元数据、字幕及扩展内容与 `state/reports/` 一起导入；通过完整性、外键和导入计数检查后，处理 WAL、关闭连接，再替换正式库。坏 JSON 或其他导入错误会列出定位信息并保留原库；异常退出时先修正源文件再重试。
+
+Windows 下 DB Browser 等其他连接可能阻止检查点或替换，先关闭这些连接再重试。替换失败时错误信息会提供备份路径。需要手动回退时，先停止所有写入、关闭 SQLite 连接，将当前数据库及其 WAL/SHM 一起另存，再恢复一致性备份，避免把旧 WAL 留给恢复后的数据库。
+
+恢复能力取决于现存文件：缺失的原始 JSON、未保存的字幕、旧目录已丢失的主页历史都不会凭空生成。旧目录只保留最新主页时，仅能恢复现存的最新信息。重复导入按稳定 `snapshot_id` / `run_id` 去重；旧文件通过确定性标识导入。
+
+### 5.3 仅重试索引或补齐附件
+
+```bash
+# 只读计划，不联网、不创建清单或数据库
+biliyt repair --target bili_example
+# 离线索引修复
+biliyt repair --target bili_example --only index --apply
+# 按内容条目分批补齐，允许联网
+biliyt repair --target bili_example --only metadata,subtitles,images --limit 10 --apply
+```
+
+`--limit` 是每目标的内容条目上限，同条目的多个修复操作不重复计数。旧归档附件的 `unknown` 状态不触发自动联网；`disabled`、`unavailable` 也不循环修复。字幕初版仅补独立字幕文件，已有视频不做字幕重封装。附件修复后会刷新相关索引。`status` 的部分完成、待索引、待修复按条目计数，三列可能重叠。
+
+### 5.4 定期空间整理（每季度或大批量建档后执行 1 次）
 ```powershell
 python -c "import sqlite3; c=sqlite3.connect('state/biliyt.db'); c.execute('PRAGMA optimize'); c.execute('VACUUM'); c.close()"
 ```
 
-### 5.4 Schema 升级纪律
+### 5.5 Schema 升级纪律
 - 任何表结构变更只能通过新增 `schema_migrations` 版本号（如 `v2`）的幂等 `ALTER TABLE` / 迁移函数完成，**禁止**手改线上库结构。
 - 每次升级前先用 5.1 节生成 `biliyt_backup.db` 快照。

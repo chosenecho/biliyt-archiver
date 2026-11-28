@@ -11,10 +11,14 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
+
+from .artifacts import clean_error, public_url
+from .atomic_io import atomic_write_json, atomic_write_text
 
 
 class SyncLockError(RuntimeError):
-    """Raised when another biliyt sync process already holds the state lock."""
+    """Raised when another biliyt write operation already holds the state lock."""
 
 
 def _utc_now_iso() -> str:
@@ -49,6 +53,11 @@ class TargetRunSummary:
     dry_run: bool = False
     errors: list[str] = field(default_factory=list)
     module_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    # These counts can overlap: an item may be partial and awaiting indexing.
+    partial: int = 0
+    index_failed: int = 0
+    pending_repair: int = 0
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -57,6 +66,8 @@ class RunReport:
     finished_at: str
     mode: str
     targets: list[TargetRunSummary] = field(default_factory=list)
+    run_id: str = field(default_factory=lambda: str(uuid4()))
+    warnings: list[str] = field(default_factory=list)
 
 
 class StateStore:
@@ -102,7 +113,7 @@ class StateStore:
                     holder = ""
                 detail = f" ({holder})" if holder else ""
                 raise SyncLockError(
-                    f"检测到另一个 biliyt sync 进程正在运行{detail}，请等待其结束后再试。"
+                    f"检测到另一个写入操作正在进行{detail}，请等待其结束后再试。"
                 ) from exc
 
             fh.seek(0)
@@ -214,7 +225,7 @@ class StateStore:
                 existing[key] = clean_meta
                 path = self.namespace_archive_path(target_id, namespace)
                 lines = [f"{k} {v}".strip() if v else k for k, v in existing.items()]
-                path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+                atomic_write_text(path, "\n".join(lines) + ("\n" if lines else ""))
                 return
 
             path = self.namespace_archive_path(target_id, namespace)
@@ -237,6 +248,8 @@ class StateStore:
                 try:
                     data = json.loads(line)
                     rec = FailedRecord(**data)
+                    rec.url = public_url(rec.url)
+                    rec.error = clean_error(rec.error)
                 except Exception:
                     continue
                 if target_id is None or rec.target_id == target_id:
@@ -247,7 +260,7 @@ class StateStore:
         with self._lock:
             self.ensure_dirs()
             content = "\n".join(json.dumps(asdict(r), ensure_ascii=False) for r in records)
-            self.failed_file.write_text(f"{content}\n" if content else "", encoding="utf-8")
+            atomic_write_text(self.failed_file, f"{content}\n" if content else "")
 
     def record_failure(
         self,
@@ -262,6 +275,8 @@ class StateStore:
         extra: dict[str, object] | None = None,
     ) -> FailedRecord:
         with self._lock:
+            url = public_url(url)
+            error = clean_error(error)
             all_records = self.load_failed()
             key = (target_id, item_type, url)
             updated: FailedRecord | None = None
@@ -314,6 +329,7 @@ class StateStore:
         item_type: str | None = None,
     ) -> None:
         with self._lock:
+            url = public_url(url)
             all_records = self.load_failed()
             remaining = [
                 r
@@ -328,13 +344,20 @@ class StateStore:
                 self._write_failed(remaining)
 
     def save_report(self, report: RunReport) -> Path:
-        self.ensure_dirs()
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        report_path = self.reports_dir / f"run_{ts}.json"
-        payload = json.dumps(asdict(report), ensure_ascii=False, indent=2)
-        report_path.write_text(payload, encoding="utf-8")
-        self.last_run_file.write_text(payload, encoding="utf-8")
-        return report_path
+        with self._lock:
+            self.ensure_dirs()
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            report_path = self.reports_dir / f"run_{ts}_{report.run_id}.json"
+            payload = asdict(report)
+            payload["warnings"] = [clean_error(message) for message in report.warnings]
+            for target in payload["targets"]:
+                target["errors"] = [clean_error(message) for message in target["errors"]]
+                target["warnings"] = [clean_error(message) for message in target["warnings"]]
+            # Commit history first; a failed latest-pointer write leaves history
+            # available for recovery. The two replacements are not a transaction.
+            atomic_write_json(report_path, payload)
+            atomic_write_json(self.last_run_file, payload)
+            return report_path
 
     def load_last_report(self) -> dict | None:
         if not self.last_run_file.exists():

@@ -9,7 +9,7 @@ import yt_dlp
 from typer.testing import CliRunner
 
 from biliyt.cli import _configure_utf8_stdio, app
-from biliyt.config import AppConfig, resolve_target
+from biliyt.config import AppConfig, load_config, resolve_target
 from biliyt.downloader import SyncEngine
 from biliyt.state import StateStore, SyncLockError
 
@@ -192,6 +192,7 @@ def test_sync_concurrent_downloads(tmp_path: Path) -> None:
 def test_sync_falls_back_without_subtitles_on_subtitle_429(tmp_path: Path) -> None:
     cfg = AppConfig.model_validate(
         {
+            "media": {"embed_subtitles": True},
             "paths": {"download_dir": str(tmp_path / "dl"), "state_dir": str(tmp_path / "state")},
             "rate_limit": {"sleep_interval": 0.0, "max_sleep_interval": 0.0},
             "targets": [{"id": "yt_sub429", "source": "@demo"}],
@@ -231,9 +232,15 @@ def test_sync_falls_back_without_subtitles_on_subtitle_429(tmp_path: Path) -> No
         pp.get("key") not in {"FFmpegSubtitlesConvertor", "FFmpegEmbedSubtitle"}
         for pp in seen_opts[1].get("postprocessors", [])
     )
-    assert len(warnings) == 1
-    assert "429" in warnings[0]
+    assert any("429" in warning for warning in warnings)
     assert state.load_failed("yt_sub429") == []
+    from biliyt.artifacts import ArtifactStore
+
+    manifest = ArtifactStore(target.download_dir, target.id).load("video", "abc12345678")
+    assert any(a.kind == "subtitle" and a.status == "failed" for a in manifest.artifacts)
+    assert any(a.kind == "subtitle_embed" and a.status == "pending" for a in manifest.artifacts)
+    assert summary.partial == 1
+    assert summary.pending_repair == 1
 
 
 def test_probe_lazy_early_stop_does_not_consume_tail(tmp_path: Path) -> None:
@@ -382,3 +389,161 @@ def test_concurrent_download_merges_archive_cleanly_and_sync_lock(tmp_path: Path
                 pass
     with state.acquire_sync_lock():
         assert state.lock_file.exists()
+
+
+def test_final_paths_index_custom_template_and_multipart(tmp_path: Path) -> None:
+    import json
+
+    from biliyt.artifacts import ArtifactStore
+    from biliyt.db import ArchiveDB
+
+    cfg = AppConfig.model_validate({
+        "paths": {"filename_template": "%(title)s.%(ext)s"},
+        "targets": [{"id": "demo", "source": "946974", "archive": {"layout": "grouped"}}],
+    })
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    state = StateStore(target.state_dir)
+    feed = [{"id": "BVdemo", "url": "https://www.bilibili.com/video/BVdemo"}]
+
+    class FinalYDL(_FakeYDL):
+        def add_post_processor(self, pp, when):
+            assert when == "after_move"
+            self.collector = pp
+
+        def download(self, urls):
+            super().download(urls)
+            final = target.download_dir / "videos"
+            final.mkdir(parents=True, exist_ok=True)
+            for part in (1, 2):
+                item_id = f"BVdemo_p{part}"
+                media = final / f"part {part}.mkv"
+                metadata = final / f"part {part}.info.json"
+                sub = final / f"part {part}.zh-Hans.srt"
+                media.write_bytes(b"media")
+                metadata.write_text(json.dumps({"id": item_id, "title": f"Part {part}"}), encoding="utf-8")
+                sub.write_text("1\n00:00:01,000 --> 00:00:02,000\n测试字幕\n", encoding="utf-8")
+                self.collector.run({
+                    "id": item_id, "filepath": str(media),
+                    "infojson_filename": str(tmp_path / "old" / metadata.name),
+                    "requested_subtitles": {"zh-Hans": {"filepath": str(tmp_path / "old" / sub.name)}},
+                })
+            return 0
+
+    engine = SyncEngine(state, ydl_factory=lambda opts: FinalYDL(opts, feed, set()), sleeper=lambda _: None)
+    summary = engine.sync_target(target)
+    assert summary.downloaded == 1
+    assert summary.index_failed == 0
+    store = ArtifactStore(target.download_dir, target.id)
+    assert {m.item_id for m in store.manifests()} == {"BVdemo_p1", "BVdemo_p2"}
+    assert all(m.index_status == "complete" for m in store.manifests())
+    with ArchiveDB(target.state_dir / "biliyt.db") as db:
+        assert db.stats()["counts"]["videos"] == 2
+        assert db.search("测试字幕")
+
+
+def test_index_failure_is_persisted_without_losing_download(tmp_path: Path, monkeypatch) -> None:
+    import json
+
+    from biliyt.artifacts import ArtifactStore
+
+    cfg = AppConfig.model_validate({"targets": [{"id": "demo", "source": "@demo"}]})
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    target.download_dir.mkdir(parents=True)
+    info = target.download_dir / "custom.info.json"
+    info.write_text(json.dumps({"id": "abc123", "title": "custom"}), encoding="utf-8")
+    messages = []
+    engine = SyncEngine(StateStore(target.state_dir), on_event=lambda event, payload: messages.append(event))
+    monkeypatch.setattr("biliyt.db.index_video_info_file", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("disk failure")))
+    engine._index_downloaded_video(target, "abc123")
+    manifest = ArtifactStore(target.download_dir, target.id).load("video", "abc123")
+    assert manifest.index_status == "failed"
+    assert "disk failure" in manifest.index_error
+    assert "item_warning" in messages
+    assert info.exists()
+
+
+def test_repair_cli_preview_is_read_only_and_apply_offline(tmp_path: Path) -> None:
+    import json
+
+    from biliyt.db import ArchiveDB
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("targets:\n  - id: demo\n    source: '@demo'\n", encoding="utf-8")
+    cfg, _ = load_config(cfg_path)
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    target.download_dir.mkdir(parents=True)
+    (target.download_dir / "custom.info.json").write_text(json.dumps({"id": "abc123", "title": "离线修复"}), encoding="utf-8")
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    runner = CliRunner()
+    preview = runner.invoke(app, ["repair", "-c", str(cfg_path), "--only", "index"])
+    assert preview.exit_code == 0, preview.output
+    assert "index" in preview.output
+    after = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    assert before == after
+    assert not target.state_dir.exists()
+    applied = runner.invoke(app, ["repair", "-c", str(cfg_path), "--only", "index", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    with ArchiveDB(target.state_dir / "biliyt.db") as db:
+        assert db.search("离线修复")
+    assert list((target.state_dir / "reports").glob("run_*.json"))
+    with StateStore(target.state_dir).acquire_sync_lock():
+        locked = runner.invoke(app, ["repair", "-c", str(cfg_path), "--apply"])
+    assert locked.exit_code == 3, locked.output
+    (target.download_dir / "broken.info.json").write_text("{broken", encoding="utf-8")
+    bad_preview = runner.invoke(app, ["repair", "-c", str(cfg_path), "--only", "index"])
+    assert bad_preview.exit_code == 2, bad_preview.output
+    assert "broken.info.json" in bad_preview.output
+
+
+def test_corrupt_manifests_are_visible_in_sync_summary(tmp_path: Path) -> None:
+    from biliyt.artifacts import ArtifactStore
+    from biliyt.state import TargetRunSummary
+
+    cfg = AppConfig.model_validate({"targets": [{"id": "demo", "source": "@demo"}]})
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    store = ArtifactStore(target.download_dir, target.id)
+    corrupt = store.path_for("video", "bad")
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_text("{broken", encoding="utf-8")
+    summary = TargetRunSummary(target.id, target.name, target.platform.value, target.url)
+    SyncEngine(StateStore(target.state_dir))._summarize_artifacts(target, summary)
+    assert summary.failed == 1
+    assert summary.errors
+
+
+def test_deferred_embedded_subtitle_stays_visible_in_repair_cli(tmp_path: Path) -> None:
+    from biliyt.artifacts import Artifact, ArtifactManifest, ArtifactStore
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("targets:\n  - id: demo\n    source: '@demo'\n", encoding="utf-8")
+    cfg, _ = load_config(cfg_path)
+    target = resolve_target(cfg, cfg.targets[0], tmp_path)
+    store = ArtifactStore(target.download_dir, target.id)
+    store.save(ArtifactManifest(target.id, "video", "abc", artifacts=[
+        Artifact("subtitle_embed", "pending", error="待重封装"),
+    ], index_status="complete"))
+    runner = CliRunner()
+    preview = runner.invoke(app, ["repair", "-c", str(cfg_path)])
+    assert preview.exit_code == 0, preview.output
+    assert "重封装" in preview.output
+    apply = runner.invoke(app, ["repair", "-c", str(cfg_path), "--apply"])
+    assert apply.exit_code == 2, apply.output
+    assert store.stats()["pending_repair"] == 1
+
+
+def test_independent_stores_can_commit_same_item_concurrently(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from biliyt.artifacts import ArtifactManifest, ArtifactStore
+
+    def write_one(index: int) -> None:
+        ArtifactStore(tmp_path / "archive", "demo").save(ArtifactManifest(
+            "demo", "video", "same-id", index_status="complete", context={"title": str(index)},
+        ))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(write_one, range(24)))
+    manifest = ArtifactStore(tmp_path / "archive", "demo").load("video", "same-id")
+    assert manifest.index_status == "complete"
+    assert manifest.context["title"].isdigit()
+    assert not list((tmp_path / "archive").rglob("*.tmp"))

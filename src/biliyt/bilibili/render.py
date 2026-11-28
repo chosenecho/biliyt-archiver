@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .client import BilibiliWebClient
+from ..artifacts import Artifact, clean_error, public_url
+from ..atomic_io import atomic_write_bytes
+from .client import BilibiliAuthError, BilibiliRiskControlError, BilibiliWebClient
 
 _CN_TZ = timezone(timedelta(hours=8))
 _INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
@@ -88,44 +90,39 @@ class ImageLocalizer:
         self._client = client
         self._enabled = enabled
         self._referer = referer
+        self.last_artifacts: list[Artifact] = []
 
     def localize(self, urls: list[str], dest_dir: Path, *, rel_prefix: str = "images") -> dict[str, str]:
         mapping: dict[str, str] = {}
-        if not self._enabled:
-            return mapping
-
-        unique_urls: list[str] = []
-        seen: set[str] = set()
-        for raw in urls:
-            norm = normalize_url(raw)
-            if not norm or norm in seen:
-                continue
-            seen.add(norm)
-            unique_urls.append(norm)
-
-        if not unique_urls:
-            return mapping
-
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        self.last_artifacts = []
+        unique_urls = list(dict.fromkeys(normalize_url(u) for u in urls if normalize_url(u)))
         for idx, url in enumerate(unique_urls, start=1):
             digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
-            # Check if any existing file already matches this digest
-            existing = list(dest_dir.glob(f"*_{digest}.*"))
-            if existing:
-                mapping[url] = f"{rel_prefix}/{existing[0].name}"
+            filename = f"{idx:02d}_{digest}{_guess_image_ext(url)}"
+            artifact = Artifact("image", "pending", f"{rel_prefix}/{filename}", public_url(url))
+            self.last_artifacts.append(artifact)
+            if not self._enabled:
+                artifact.status = "disabled"
                 continue
-
+            existing = sorted(p for p in dest_dir.glob(f"*_{digest}.*") if p.is_file() and p.suffix != ".tmp")
+            if existing:
+                artifact.path = f"{rel_prefix}/{existing[0].name}"
+                artifact.status = "complete"
+                mapping[url] = artifact.path
+                continue
             try:
                 data, ctype = self._client.download_binary(url, referer=self._referer)
-            except Exception:
-                # Keep original remote URL in markdown as fallback instead of failing whole item
+                filename = f"{idx:02d}_{digest}{_guess_image_ext(url, ctype)}"
+                artifact.path = f"{rel_prefix}/{filename}"
+                atomic_write_bytes(dest_dir / filename, data)
+            except (BilibiliRiskControlError, BilibiliAuthError):
+                raise
+            except Exception as exc:
+                artifact.status = "failed"
+                artifact.error = clean_error(exc)
                 continue
-
-            ext = _guess_image_ext(url, ctype)
-            filename = f"{idx:02d}_{digest}{ext}"
-            (dest_dir / filename).write_bytes(data)
-            mapping[url] = f"{rel_prefix}/{filename}"
-
+            artifact.status = "complete"
+            mapping[url] = artifact.path
         return mapping
 
 
