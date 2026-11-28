@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import atomic_write_json
 from .bilibili.archiver import bv_to_av
 from .bilibili.render import format_unix_date, format_unix_ts
 from .config import ResolvedTarget
 from .platform import Platform, extract_bilibili_uid
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SRT_INDEX_RE = re.compile(r"^\d+$")
 _SRT_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}")
@@ -238,6 +243,27 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _canonical_timestamp(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        return value
+
+
+def _stable_id(kind: str, payload: Any) -> str:
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return f"{kind}-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _run_id(mode: str, started_at: str, finished_at: str, summary: dict[str, Any]) -> str:
+    return str(summary.get("run_id") or _stable_id("run", {
+        "mode": mode, "started_at": started_at, "finished_at": finished_at, "summary": summary,
+    }))
+
+
 def _rel_posix(path: Path | None, base_dir: Path) -> str | None:
     if path is None:
         return None
@@ -355,8 +381,12 @@ class ArchiveDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
-        self._configure()
-        self._ensure_schema()
+        try:
+            self._configure()
+            self._ensure_schema()
+        except Exception:
+            self._conn.close()
+            raise
 
     def _configure(self) -> None:
         self._conn.execute("PRAGMA journal_mode = WAL")
@@ -366,17 +396,50 @@ class ArchiveDB:
 
     def _ensure_schema(self) -> None:
         with self._conn:
-            for stmt in _DDL_STATEMENTS:
-                self._conn.execute(stmt)
-            row = self._conn.execute(
-                "SELECT MAX(version) AS v FROM schema_migrations"
-            ).fetchone()
-            current = int(row["v"]) if row and row["v"] is not None else 0
-            if current < SCHEMA_VERSION:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO schema_migrations(version, applied_at, description) VALUES (?, ?, ?)",
-                    (SCHEMA_VERSION, _utc_now_iso(), "Initial structured archive + FTS5 trigram schema"),
-                )
+            self._conn.execute("BEGIN")
+            self._conn.execute(_DDL_STATEMENTS[0])
+            applied = {row[0] for row in self._conn.execute("SELECT version FROM schema_migrations")}
+            for version, description, migrate in (
+                (1, "Initial structured archive + FTS5 trigram schema", self._migrate_v1),
+                (2, "Stable profile snapshot and sync run identities", self._migrate_v2),
+            ):
+                if version not in applied:
+                    migrate()
+                    self._conn.execute(
+                        "INSERT INTO schema_migrations(version, applied_at, description) VALUES (?, ?, ?)",
+                        (version, _utc_now_iso(), description),
+                    )
+
+    def _migrate_v1(self) -> None:
+        for statement in _DDL_STATEMENTS:
+            self._conn.execute(statement)
+
+    def _migrate_v2(self) -> None:
+        for table, column in (("profile_snapshots", "snapshot_id"), ("sync_runs", "run_id")):
+            columns = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in columns:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        for row in self._conn.execute("SELECT target_id, updated_at FROM profiles").fetchall():
+            self._conn.execute("UPDATE profiles SET updated_at=? WHERE target_id=?",
+                               (_canonical_timestamp(row["updated_at"]), row["target_id"]))
+        for row in self._conn.execute("SELECT * FROM profile_snapshots").fetchall():
+            row = dict(row)
+            row["fetched_at"] = _canonical_timestamp(row["fetched_at"])
+            snapshot_id = row["snapshot_id"] or _stable_id("snapshot", {
+                key: row[key] for key in ("target_id", "fetched_at", "follower", "following", "archive_views", "likes")
+            })
+            self._conn.execute("UPDATE profile_snapshots SET snapshot_id=?, fetched_at=? WHERE id=?",
+                               (snapshot_id, row["fetched_at"], row["id"]))
+        for row in self._conn.execute("SELECT * FROM sync_runs").fetchall():
+            summary = json.loads(row["summary_json"])
+            run_id = row["run_id"] or _run_id(row["mode"], row["started_at"], row["finished_at"], summary)
+            self._conn.execute("UPDATE sync_runs SET run_id=? WHERE id=?", (run_id, row["id"]))
+        # v1 could contain exact duplicates after repeated disk imports.
+        for table, column in (("profile_snapshots", "snapshot_id"), ("sync_runs", "run_id")):
+            self._conn.execute(
+                f"DELETE FROM {table} WHERE id NOT IN (SELECT MIN(id) FROM {table} GROUP BY {column})"
+            )
+            self._conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_{column} ON {table}({column})")
 
     def close(self) -> None:
         try:
@@ -464,8 +527,14 @@ class ArchiveDB:
         avatar_relpath: str | None = None,
         banner_relpath: str | None = None,
         fetched_at: str | None = None,
+        snapshot_id: str | None = None,
     ) -> None:
-        ts = fetched_at or _utc_now_iso()
+        ts = _canonical_timestamp(fetched_at) if fetched_at else _utc_now_iso()
+        snapshot_id = snapshot_id or _stable_id("profile", {
+            "target_id": target_id, "fetched_at": ts if fetched_at else None, "user_info": user_info,
+            "relation_stat": relation_stat, "upstat": upstat, "collections": collections,
+            "avatar_relpath": avatar_relpath, "banner_relpath": banner_relpath,
+        })
         official_title = str((user_info.get("official") or {}).get("title") or "")
         follower = (relation_stat or {}).get("follower")
         following = (relation_stat or {}).get("following")
@@ -496,6 +565,8 @@ class ArchiveDB:
                     collections_json=excluded.collections_json,
                     raw_json=excluded.raw_json,
                     updated_at=excluded.updated_at
+                WHERE (excluded.updated_at >= profiles.updated_at AND excluded.updated_at != 'unknown')
+                   OR profiles.updated_at = 'unknown'
                 """,
                 (
                     target_id,
@@ -518,10 +589,11 @@ class ArchiveDB:
             )
             self._conn.execute(
                 """
-                INSERT INTO profile_snapshots(target_id, fetched_at, follower, following, archive_views, likes)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO profile_snapshots(target_id, fetched_at, follower, following, archive_views, likes, snapshot_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_id) DO NOTHING
                 """,
-                (target_id, ts, follower, following, archive_views, likes),
+                (target_id, ts, follower, following, archive_views, likes, snapshot_id),
             )
 
     def upsert_video(
@@ -963,11 +1035,14 @@ class ArchiveDB:
         started_at: str,
         finished_at: str,
         summary_dict: dict[str, Any],
+        run_id: str | None = None,
     ) -> None:
+        run_id = run_id or _run_id(mode, started_at, finished_at, summary_dict)
         with self._conn:
             self._conn.execute(
-                "INSERT INTO sync_runs(mode, started_at, finished_at, summary_json) VALUES (?, ?, ?, ?)",
-                (mode, started_at, finished_at, json.dumps(summary_dict, ensure_ascii=False)),
+                "INSERT INTO sync_runs(mode, started_at, finished_at, summary_json, run_id) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id) DO NOTHING",
+                (mode, started_at, finished_at, json.dumps(summary_dict, ensure_ascii=False), run_id),
             )
 
     # ------------------------------------------------------------------
@@ -1111,13 +1186,19 @@ def _find_sibling_by_ext(base_dir: Path, stem: str, exts: tuple[str, ...]) -> Pa
     return None
 
 
-def index_video_info_file(db: ArchiveDB, target: ResolvedTarget, info_file: Path) -> bool:
+def index_video_info_file(
+    db: ArchiveDB, target: ResolvedTarget, info_file: Path, *, errors: list[str] | None = None,
+    paths: dict[str, Path | str | None] | None = None,
+) -> bool:
     """Index a single `.info.json` and its sibling subtitle/media files into `ArchiveDB`."""
     try:
-        info = json.loads(info_file.read_text(encoding="utf-8", errors="ignore"))
-    except Exception:
-        return False
-    if not isinstance(info, dict):
+        info_file.resolve().relative_to(target.download_dir.resolve())
+        info = _read_rebuild_json(info_file)
+        if not isinstance(info, dict) or not (info.get("id") or info.get("display_id")):
+            raise ValueError("video metadata requires an id")
+    except Exception as exc:
+        if errors is not None:
+            errors.append(f"{info_file}: {exc}")
         return False
 
     stem = info_file.name[: -len(".info.json")]
@@ -1125,6 +1206,16 @@ def index_video_info_file(db: ArchiveDB, target: ResolvedTarget, info_file: Path
     sub_file = _find_best_subtitle(vdir, stem)
     vid_file = _find_sibling_by_ext(vdir, stem, (".mp4", ".mkv", ".webm"))
     thumb_file = _find_sibling_by_ext(vdir, stem, (".jpg", ".png", ".webp"))
+    if paths:
+        def override(keys: tuple[str, ...], fallback: Path | None) -> Path | None:
+            for key in keys:
+                if key in paths:
+                    return _archive_path(paths[key], target.download_dir)
+            return fallback
+
+        vid_file = override(("video", "media", "video_path", "media_path", "video_relpath"), vid_file)
+        sub_file = override(("subtitle", "subtitle_path", "subtitle_relpath"), sub_file)
+        thumb_file = override(("thumbnail", "thumbnail_path", "thumbnail_relpath"), thumb_file)
     sub_text = extract_srt_plain_text(sub_file) if sub_file else ""
 
     db.upsert_video(
@@ -1140,8 +1231,12 @@ def index_video_info_file(db: ArchiveDB, target: ResolvedTarget, info_file: Path
     return True
 
 
-def rebuild_target_from_disk(db: ArchiveDB, target: ResolvedTarget) -> dict[str, int]:
+def rebuild_target_from_disk(
+    db: ArchiveDB, target: ResolvedTarget, *, errors: list[str] | None = None
+) -> dict[str, int]:
     """Scan a target's download directory and idempotently populate SQLite without network calls."""
+    if errors is None:
+        errors = []
     counts = {
         "profiles": 0,
         "videos": 0,
@@ -1156,66 +1251,63 @@ def rebuild_target_from_disk(db: ArchiveDB, target: ResolvedTarget) -> dict[str,
 
     up_uid = extract_bilibili_uid(target.source) if target.platform == Platform.BILIBILI else None
 
-    # 1. Profile
+    # 1. Historical and latest profiles share stable snapshot identities.
     profile_json = root / "profile" / "profile.json"
+    profile_files = sorted((root / "profile" / "snapshots").glob("*.json"))
     if profile_json.exists():
+        profile_files.append(profile_json)
+    for profile_file in profile_files:
         try:
-            pdata = json.loads(profile_json.read_text(encoding="utf-8", errors="ignore"))
-            cols_path = root / "profile" / "collections.json"
-            cols = (
-                json.loads(cols_path.read_text(encoding="utf-8", errors="ignore"))
-                if cols_path.exists()
-                else []
-            )
-            db.upsert_profile(
-                target_id=target.id,
-                platform=target.platform.value,
-                uid=pdata.get("uid") or up_uid or "",
-                user_info=pdata.get("user_info") or {},
-                relation_stat=pdata.get("relation_stat"),
-                upstat=pdata.get("upstat"),
-                collections=cols if isinstance(cols, list) else [],
-                fetched_at=pdata.get("fetched_at"),
-            )
-            counts["profiles"] += 1
-        except Exception:
-            pass
+            pdata = _read_rebuild_json(profile_file)
+            if not isinstance(pdata, dict):
+                raise ValueError("profile metadata must be an object")
+            if "collections" not in pdata:
+                cols_path = root / "profile" / "collections.json"
+                pdata["collections"] = _read_rebuild_json(cols_path) if cols_path.exists() else []
+            _import_profile_payload(db, pdata, target.id, target.platform.value, up_uid, root)
+            if not pdata.get("history_only"):
+                counts["profiles"] += 1
+        except Exception as exc:
+            errors.append(f"{profile_file}: {exc}")
 
     # 2. Videos (flat + grouped) + video comments
-    video_dirs = [root]
-    if (root / "videos").is_dir():
-        video_dirs.append(root / "videos")
-    for vdir in video_dirs:
-        for info_file in sorted(vdir.glob("*.info.json")):
-            if index_video_info_file(db, target, info_file):
+    for info_file in sorted(root.rglob("*.info.json")):
+        vdir = info_file.parent
+        try:
+            if index_video_info_file(db, target, info_file, errors=errors):
                 counts["videos"] += 1
-            stem = info_file.name[: -len(".info.json")]
-            cmt_file = vdir / f"{stem}.comments.json"
-            if cmt_file.exists():
-                try:
-                    info = json.loads(info_file.read_text(encoding="utf-8", errors="ignore"))
-                    bundle = json.loads(cmt_file.read_text(encoding="utf-8", errors="ignore"))
-                    bvid = str(info.get("id") or "")
-                    oid = str(bundle.get("oid") or info.get("aid") or bv_to_av(bvid) or bvid)
-                    counts["comments"] += db.upsert_comments(
-                        target_id=target.id,
-                        carrier_kind="video",
-                        oid=oid,
-                        rtype=int(bundle.get("type") or 1),
-                        carrier_title=str(info.get("title") or bvid),
-                        source_url=str(info.get("webpage_url") or f"https://www.bilibili.com/video/{bvid}"),
-                        bundle=bundle,
-                        up_uid=up_uid,
-                    )
-                except Exception:
-                    pass
+        except Exception as exc:
+            errors.append(f"{info_file}: {exc}")
+        stem = info_file.name[: -len(".info.json")]
+        cmt_file = vdir / f"{stem}.comments.json"
+        if cmt_file.exists():
+            try:
+                info = _read_rebuild_json(info_file)
+                bundle = _read_rebuild_json(cmt_file)
+                bvid = str(info.get("id") or "")
+                oid = str(bundle.get("oid") or info.get("aid") or bv_to_av(bvid) or bvid)
+                counts["comments"] += db.upsert_comments(
+                    target_id=target.id,
+                    carrier_kind="video",
+                    oid=oid,
+                    rtype=int(bundle.get("type") or 1),
+                    carrier_title=str(info.get("title") or bvid),
+                    source_url=str(info.get("webpage_url") or f"https://www.bilibili.com/video/{bvid}"),
+                    bundle=bundle,
+                    up_uid=up_uid,
+                )
+            except Exception as exc:
+                errors.append(f"{cmt_file}: {exc}")
+
 
     # 3. Dynamics + dynamic comments
     dyn_root = root / "dynamics"
     if dyn_root.is_dir():
         for dyn_file in sorted(dyn_root.glob("*/dynamic.json")):
             try:
-                item = json.loads(dyn_file.read_text(encoding="utf-8", errors="ignore"))
+                item = _read_rebuild_json(dyn_file)
+                if not item.get("id_str"):
+                    raise ValueError("dynamic metadata requires id_str")
                 md_file = dyn_file.with_name("dynamic.md")
                 md_text = md_file.read_text(encoding="utf-8", errors="ignore") if md_file.exists() else ""
                 img_dir = dyn_file.parent / "images"
@@ -1235,7 +1327,7 @@ def rebuild_target_from_disk(db: ArchiveDB, target: ResolvedTarget) -> dict[str,
 
                 cmt_file = dyn_file.with_name("comments.json")
                 if cmt_file.exists():
-                    bundle = json.loads(cmt_file.read_text(encoding="utf-8", errors="ignore"))
+                    bundle = _read_rebuild_json(cmt_file)
                     dyn_id = str(item.get("id_str") or "")
                     basic = item.get("basic") or {}
                     oid = str(bundle.get("oid") or basic.get("comment_id_str") or dyn_id)
@@ -1250,15 +1342,17 @@ def rebuild_target_from_disk(db: ArchiveDB, target: ResolvedTarget) -> dict[str,
                         bundle=bundle,
                         up_uid=up_uid,
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"{dyn_file}: {exc}")
 
     # 4. Articles + article comments
     art_root = root / "articles"
     if art_root.is_dir():
         for art_file in sorted(art_root.glob("*/article.json")):
             try:
-                payload = json.loads(art_file.read_text(encoding="utf-8", errors="ignore"))
+                payload = _read_rebuild_json(art_file)
+                if not (payload.get("cv_id") or (payload.get("meta") or payload).get("id")):
+                    raise ValueError("article metadata requires cv_id or id")
                 md_file = art_file.with_name("article.md")
                 md_text = md_file.read_text(encoding="utf-8", errors="ignore") if md_file.exists() else ""
                 img_dir = art_file.parent / "images"
@@ -1278,7 +1372,7 @@ def rebuild_target_from_disk(db: ArchiveDB, target: ResolvedTarget) -> dict[str,
 
                 cmt_file = art_file.with_name("comments.json")
                 if cmt_file.exists():
-                    bundle = json.loads(cmt_file.read_text(encoding="utf-8", errors="ignore"))
+                    bundle = _read_rebuild_json(cmt_file)
                     cv_id = str(payload.get("cv_id") or "")
                     title = str((payload.get("meta") or {}).get("title") or f"专栏 cv{cv_id}")
                     counts["comments"] += db.upsert_comments(
@@ -1291,20 +1385,300 @@ def rebuild_target_from_disk(db: ArchiveDB, target: ResolvedTarget) -> dict[str,
                         bundle=bundle,
                         up_uid=up_uid,
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"{art_file}: {exc}")
 
     # 5. Favorites
     fav_root = root / "favorites"
     if fav_root.is_dir():
         for fav_file in sorted(fav_root.glob("fav_*.json")):
             try:
-                fdata = json.loads(fav_file.read_text(encoding="utf-8", errors="ignore"))
+                fdata = _read_rebuild_json(fav_file)
                 folder = fdata.get("folder") or {}
+                if not folder.get("id"):
+                    raise ValueError("favorite metadata requires folder.id")
                 medias = fdata.get("medias") or []
                 db.upsert_favorite_folder(target_id=target.id, folder=folder, medias=medias)
                 counts["favorites"] += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"{fav_file}: {exc}")
 
     return counts
+
+
+def _archive_path(value: Path | str | None, root: Path) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    path = path if path.is_absolute() else root / path
+    path.resolve().relative_to(root.resolve())
+    return path
+
+
+def _import_profile_payload(
+    db: ArchiveDB, payload: dict[str, Any], target_id: str, platform: str,
+    up_uid: int | None = None, root: Path | None = None,
+) -> None:
+    if payload.get("history_only"):
+        snapshot = payload["snapshot"]
+        if not isinstance(snapshot, dict) or not snapshot.get("fetched_at"):
+            raise ValueError("historical snapshot requires fetched_at")
+        snapshot_id = payload.get("snapshot_id") or _stable_id("snapshot", {
+            "target_id": target_id, **snapshot,
+        })
+        with db._conn:
+            db._conn.execute(
+                "INSERT INTO profile_snapshots(target_id, fetched_at, follower, following, archive_views, likes, snapshot_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(snapshot_id) DO NOTHING",
+                (target_id, _canonical_timestamp(snapshot["fetched_at"]), snapshot.get("follower"), snapshot.get("following"),
+                 snapshot.get("archive_views"), snapshot.get("likes"), snapshot_id),
+            )
+        return
+    assets = {}
+    for key in ("avatar_relpath", "banner_relpath"):
+        value = payload.get(key)
+        if value and root is not None:
+            value = _rel_posix(_archive_path(value, root), root)
+        assets[key] = value
+    db.upsert_profile(
+        target_id=target_id, platform=platform, uid=payload.get("uid") or up_uid or "",
+        user_info=payload.get("user_info") or {}, relation_stat=payload.get("relation_stat"),
+        upstat=payload.get("upstat"), collections=payload.get("collections") or [],
+        fetched_at=payload.get("fetched_at") or "unknown", snapshot_id=payload.get("snapshot_id"), **assets,
+    )
+
+
+def _write_history_file(path: Path, payload: dict[str, Any], identity_key: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"History destination is a symlink: {path}")
+    if path.exists():
+        existing = _read_rebuild_json(path)
+        if not isinstance(existing, dict) or existing.get(identity_key) != payload.get(identity_key):
+            raise ValueError(f"Conflicting historical identity: {path}")
+        # Upgrade a statistics-only export when the full profile is now available.
+        if not existing.get("history_only") or payload.get("history_only"):
+            return
+    atomic_write_json(path, payload)
+
+
+def export_history(
+    db: ArchiveDB, targets: list[ResolvedTarget], *, errors: list[str] | None = None,
+) -> None:
+    """Persist DB-only history before reset, including targets absent from current config.
+
+    Known profiles use their archive snapshot directory; removed targets use
+    state/profile-history. Reports are retained whole, including multi-target runs.
+    """
+    failures = errors if errors is not None else []
+    targets_by_id = {target.id: target for target in targets}
+    state_dir = db.db_path.parent
+    snapshots = [dict(row) for row in db._conn.execute("SELECT * FROM profile_snapshots ORDER BY id")]
+    profiles = {row["target_id"]: dict(row) for row in db._conn.execute("SELECT * FROM profiles")}
+    payloads = []
+    for snapshot in snapshots:
+        target_id = snapshot["target_id"]
+        target = targets_by_id.get(target_id)
+        profile = profiles.get(target_id)
+        snapshot_id = snapshot["snapshot_id"] or _stable_id("snapshot", {
+            key: snapshot[key] for key in ("target_id", "fetched_at", "follower", "following", "archive_views", "likes")
+        })
+        snapshot["snapshot_id"] = snapshot_id
+        payload = {
+            "snapshot_id": snapshot_id, "target_id": target_id,
+            "platform": target.platform.value if target else (profile or {}).get("platform", "bilibili"),
+            "history_only": True,
+            "snapshot": {key: snapshot[key] for key in ("fetched_at", "follower", "following", "archive_views", "likes")},
+        }
+        payloads.append(payload)
+    # Also retain the full latest profile and its asset paths, even for removed targets.
+    for target_id, profile in profiles.items():
+        try:
+            matching = [row for row in snapshots if row["target_id"] == target_id and all(
+                row[key] == profile[key] for key in ("follower", "following", "archive_views", "likes")
+            ) and row["fetched_at"] == profile["updated_at"]]
+            identity = matching[-1]["snapshot_id"] if matching else _stable_id("profile-row", profile)
+            payloads.insert(0, {
+                "snapshot_id": identity, "target_id": target_id, "platform": profile["platform"],
+                "uid": profile["uid"], "fetched_at": profile["updated_at"],
+                "user_info": json.loads(profile["raw_json"] or "{}"),
+                "relation_stat": {"follower": profile["follower"], "following": profile["following"]},
+                "upstat": {"archive": {"view": profile["archive_views"]}, "likes": profile["likes"]},
+                "collections": json.loads(profile["collections_json"] or "[]"),
+                "avatar_relpath": profile["avatar_relpath"], "banner_relpath": profile["banner_relpath"],
+            })
+        except Exception as exc:
+            failures.append(f"profiles[{target_id}]: {exc}")
+    for payload in payloads:
+        target_id = payload["target_id"]
+        target = targets_by_id.get(target_id)
+        directory = (target.download_dir / "profile" / "snapshots") if target else (
+            state_dir / "profile-history" / _stable_id("target", target_id)
+        )
+        path = directory / (_stable_id("snapshot-file", payload["snapshot_id"]) + ".json")
+        try:
+            if target:
+                path.resolve().relative_to(target.download_dir.resolve())
+            else:
+                path.resolve().relative_to(state_dir.resolve())
+            _write_history_file(path, payload, "snapshot_id")
+        except Exception as exc:
+            failures.append(f"{path}: {exc}")
+    for row in db._conn.execute("SELECT * FROM sync_runs"):
+        try:
+            summary = json.loads(row["summary_json"])
+            identity = row["run_id"] or _run_id(row["mode"], row["started_at"], row["finished_at"], summary)
+            payload = {
+                "run_id": identity, "mode": row["mode"], "started_at": row["started_at"],
+                "finished_at": row["finished_at"], "summary": summary,
+            }
+            path = state_dir / "reports" / (_stable_id("run-file", identity) + ".json")
+            path.resolve().relative_to(state_dir.resolve())
+            _write_history_file(path, payload, "run_id")
+        except Exception as exc:
+            failures.append(f"sync_runs[{row['id']}]: {exc}")
+    if errors is None and failures:
+        raise RebuildError("History export errors:\n" + "\n".join(failures))
+
+
+def _import_state_history(
+    db: ArchiveDB, state_dir: Path, targets: list[ResolvedTarget], errors: list[str], *, all_targets: bool,
+) -> dict[str, int]:
+    selected = {target.id for target in targets}
+    profile_counts: dict[str, int] = {}
+    for path in sorted((state_dir / "reports").glob("*.json")):
+        try:
+            path.resolve().relative_to(state_dir.resolve())
+            payload = _read_rebuild_json(path)
+            if not isinstance(payload, dict):
+                raise ValueError("run report must be an object")
+            summary = payload.get("summary", payload)
+            if not isinstance(summary, dict):
+                raise ValueError("run report summary must be an object")
+            report_targets = {item["target_id"] for item in summary.get("targets", [])}
+            if not all_targets and report_targets and not (selected & report_targets):
+                continue
+            db.record_sync_run(
+                mode=payload["mode"], started_at=payload["started_at"], finished_at=payload["finished_at"],
+                summary_dict=summary, run_id=payload.get("run_id"),
+            )
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    for path in sorted((state_dir / "profile-history").glob("*/*.json")):
+        try:
+            path.resolve().relative_to(state_dir.resolve())
+            payload = _read_rebuild_json(path)
+            target_id = payload["target_id"]
+            if all_targets or target_id in selected:
+                _import_profile_payload(db, payload, target_id, payload["platform"])
+                if not payload.get("history_only"):
+                    profile_counts[target_id] = profile_counts.get(target_id, 0) + 1
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    return profile_counts
+
+
+class RebuildError(RuntimeError):
+    """A rebuild failed; the existing database is retained."""
+
+
+def _read_rebuild_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+
+
+def _cleanup_rebuild_file(path: Path, db_path: Path) -> None:
+    """Only remove this operation's generated sibling files, never the live database."""
+    if path.parent.resolve() != db_path.parent.resolve() or not path.name.startswith(
+        f".{db_path.name}.rebuild-"
+    ):
+        raise ValueError(f"Unexpected rebuild cleanup path: {path}")
+    if path.resolve() == db_path.resolve() or path.is_symlink():
+        raise ValueError(f"Unsafe rebuild cleanup path: {path}")
+    path.unlink(missing_ok=True)
+
+
+def rebuild_database(
+    db_path: Path, targets: list[ResolvedTarget], *, reset: bool = False
+) -> dict[str, dict[str, int]]:
+    """Import offline archives; caller must hold the StateStore writer lock.
+
+    Reset builds and validates a sibling database before replacing the live file.
+    A SQLite backup of the original is retained, including on replacement failure.
+    """
+    errors: list[str] = []
+    results: dict[str, dict[str, int]] = {}
+    if not reset:
+        with ArchiveDB(db_path) as db:
+            for target in targets:
+                results[target.id] = rebuild_target_from_disk(db, target, errors=errors)
+            historical_profiles = _import_state_history(db, db_path.parent, targets, errors, all_targets=False)
+            for target_id, count in historical_profiles.items():
+                if target_id in results:
+                    results[target_id]["profiles"] += count
+        if errors:
+            raise RebuildError("Import errors:\n" + "\n".join(errors))
+        return results
+
+    db_path = db_path.absolute()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.is_symlink():
+        raise RebuildError(f"Database path is a symlink: {db_path}")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{db_path.name}.rebuild-", dir=db_path.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    backup_path: Path | None = None
+    try:
+        if db_path.exists():
+            fd, backup_name = tempfile.mkstemp(prefix=f"{db_path.name}.backup-", suffix=".db", dir=db_path.parent)
+            os.close(fd)
+            backup_path = Path(backup_name)
+            with closing(sqlite3.connect(str(db_path), timeout=5)) as source:
+                with closing(sqlite3.connect(str(backup_path))) as backup:
+                    source.backup(backup)
+            with ArchiveDB(backup_path) as old_db:
+                # Pass the original state directory; the backup is a sibling of the live DB.
+                export_history(old_db, targets, errors=errors)
+            if errors:
+                raise RebuildError("History export errors:\n" + "\n".join(errors))
+        with ArchiveDB(temp_path) as db:
+            for target in targets:
+                results[target.id] = rebuild_target_from_disk(db, target, errors=errors)
+            historical_profiles = _import_state_history(db, db_path.parent, targets, errors, all_targets=True)
+            for target_id, count in historical_profiles.items():
+                if target_id in results:
+                    results[target_id]["profiles"] += count
+            if errors:
+                raise RebuildError("Import errors; original database retained:\n" + "\n".join(errors))
+            if db._conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RebuildError("Rebuilt database failed integrity_check")
+            if db._conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RebuildError("Rebuilt database failed foreign_key_check")
+            counts = db.stats()["counts"]
+            for kind in ("profiles", "videos", "dynamics", "articles", "favorites", "comments"):
+                imported = sum(result[kind] for result in results.values())
+                actual = counts[kind]
+                if kind == "profiles":
+                    actual = sum(db._conn.execute("SELECT COUNT(*) FROM profiles WHERE target_id=?", (target.id,)).fetchone()[0] for target in targets)
+                if actual > imported or (imported > 0 and actual == 0):
+                    raise RebuildError(f"Rebuilt database count mismatch: {kind}")
+            db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db._conn.execute("PRAGMA journal_mode = DELETE")
+
+        if db_path.exists():
+            with closing(sqlite3.connect(str(db_path), timeout=5)) as source:
+                checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint[0] != 0:
+                    raise RebuildError("Database is busy; checkpoint failed")
+                # Switching away from WAL requires other readers to release their connections.
+                source.execute("PRAGMA journal_mode = DELETE")
+        # All SQLite handles are closed before replacement (required on Windows).
+        os.replace(temp_path, db_path)
+        return results
+    except Exception as exc:
+        recovery = f" Backup: {backup_path}" if backup_path else ""
+        raise RebuildError(f"Rebuild failed; original database retained. {exc}{recovery}") from exc
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            _cleanup_rebuild_file(Path(str(temp_path) + suffix), db_path)

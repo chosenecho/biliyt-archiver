@@ -549,3 +549,87 @@ def test_comments_recent_refresh_window_and_retry_writes_sqlite(tmp_path: Path) 
     assert outcome == "downloaded", detail
     with ArchiveDB(state.state_dir / "biliyt.db") as db:
         assert db.stats()["counts"]["comments"] >= 3
+
+
+def test_profile_snapshots_preserve_history_and_asset_paths(tmp_path: Path) -> None:
+    from biliyt.artifacts import ArtifactStore
+
+    target = _make_target(tmp_path)
+    client = _FakeBilibiliClient()
+    archiver = BilibiliArchiver(StateStore(target.state_dir))
+    assert archiver.sync_profile(target, client, 23191782).saved == 1
+    first = json.loads((target.download_dir / "profile/profile.json").read_text(encoding="utf-8"))
+    assert archiver.sync_profile(target, client, 23191782).saved == 1
+    latest = json.loads((target.download_dir / "profile/profile.json").read_text(encoding="utf-8"))
+    assert first["snapshot_id"] != latest["snapshot_id"]
+    snapshots = list((target.download_dir / "profile/snapshots").glob("*.json"))
+    assert len(snapshots) == 2
+    assert first["collections"]
+    for key in ("avatar_relpath", "banner_relpath"):
+        assert first[key].startswith("profile/assets/")
+        assert (target.download_dir / first[key]).is_file()
+    manifests = ArtifactStore(target.download_dir, target.id).manifests()
+    assert len(manifests) == 2
+    assert all(m.context["image_dir"] == "profile/assets" for m in manifests)
+    assert all(a.path.startswith("profile/assets/") for m in manifests for a in m.artifacts if a.kind == "image")
+
+
+def test_failed_image_retains_complete_body_and_repair_coordinates(tmp_path: Path) -> None:
+    from biliyt.artifacts import ArtifactStore
+
+    class Client(_FakeBilibiliClient):
+        def download_binary(self, url: str, *, referer: str | None = None) -> tuple[bytes, str]:
+            raise RuntimeError("HTTP 403 cookie=private-value")
+
+    target = _make_target(tmp_path)
+    client = Client()
+    state = StateStore(target.state_dir)
+    archiver = BilibiliArchiver(state)
+    result = archiver.sync_dynamics(target, client, 23191782, full=True)
+    assert result.saved == 4 and result.failed == 0
+    manifest = ArtifactStore(target.download_dir, target.id).load("dynamic", "dyn_2")
+    assert manifest is not None and manifest.needs_repair
+    image = next(a for a in manifest.artifacts if a.kind == "image")
+    assert image.status == "failed" and image.path and image.source_url
+    assert "private-value" not in image.error
+    assert all(a.status == "complete" for a in manifest.artifacts if a.kind in {"metadata", "markdown"})
+    assert "dyn_2" in state.read_namespace_archive(target.id, "dynamics")
+
+
+def test_index_failure_is_explicit_without_refetching_body(tmp_path: Path, monkeypatch: Any) -> None:
+    from biliyt.artifacts import ArtifactStore
+
+    target = _make_target(tmp_path)
+    state = StateStore(target.state_dir)
+    events: list[str] = []
+    archiver = BilibiliArchiver(state, on_event=lambda event, payload: events.append(event))
+    def fail_db() -> None:
+        raise RuntimeError("SQLite disk full")
+    monkeypatch.setattr(archiver, "_open_db", fail_db)
+    result = archiver.sync_articles(target, _FakeBilibiliClient(), 23191782)
+    assert result.saved == 1 and result.failed == 0
+    manifest = ArtifactStore(target.download_dir, target.id).load("article", "cv987654")
+    assert manifest is not None and manifest.index_status == "failed"
+    assert "disk full" in manifest.index_error and "ext_index_warning" in events
+    payload = json.loads((target.download_dir / manifest.context["metadata_path"]).read_text(encoding="utf-8"))
+    assert "专栏正文内容" in payload["html_text"]
+    assert state.read_namespace_archive(target.id, "articles") == {"cv987654"}
+    assert archiver.sync_articles(target, _FakeBilibiliClient(), 23191782).saved == 0
+
+
+def test_comment_failure_paths_are_relative_and_old_external_paths_rejected(tmp_path: Path) -> None:
+    target = _make_target(tmp_path)
+    state = StateStore(target.state_dir)
+    target.download_dir.mkdir(parents=True)
+    (target.download_dir / "video.info.json").write_text(json.dumps({"id": "BV17x411w7KC"}), encoding="utf-8")
+    class Client(_FakeBilibiliClient):
+        def get_replies_main_page(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("timeout")
+    archiver = BilibiliArchiver(state, client_factory=lambda _: Client())
+    assert archiver.sync_comments(target, Client(), 23191782).failed == 1
+    record = state.load_failed(target_id=target.id)[0]
+    assert not Path(record.extra["json_path"]).is_absolute()
+    record.extra["json_path"] = str(tmp_path / "outside.json")
+    outcome, detail = archiver.retry_failed_item(target, record)
+    assert outcome == "failed" and "outside" in detail
+    assert not (tmp_path / "outside.json").exists()

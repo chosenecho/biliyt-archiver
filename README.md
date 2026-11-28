@@ -20,7 +20,7 @@
 | 增量更新与风控节流 | 直接拉全量列表，容易反复触发限流 | 两阶段同步：先轻量探查并过滤已归档/不达标条目，再按限速与并发上限逐条下载 |
 | B 站非视频内容 | 仅覆盖投稿视频 | 补充 **主页档案与合集、动态（含转发与原图本地化）、专栏（旧 `cv` + 新版 Opus）、公开收藏夹清单、精选评论（置顶 + UP 主回复 + 热门前 N）**，Markdown + JSON 双存 |
 | 本地检索与元数据管理 | 散落的 `.info.json` 与 `.srt` 文件 | 同步写入本地 `state/biliyt.db`（WAL + FTS5 trigram），支持 `biliyt search` 跨视频/字幕/动态/专栏/评论检索，且可零网络从 `downloads/` 重建 |
-| 失败补漏与运维审计 | 报错后需手动找回漏下的链接 | 失败自动进入 `state/failed.jsonl`，随时 `biliyt sync --retry-failed` 补下；每次同步落盘 JSON 报告 |
+| 失败补漏与运维审计 | 报错后需手动找回漏下的链接 | 抓取失败进入 `state/failed.jsonl`；逐条产物清单记录附件缺项与索引状态，`biliyt repair` 预览补齐计划；同步报告保留运行历史 |
 
 **什么时候不该用 `biliyt`：**
 
@@ -126,12 +126,32 @@ biliyt search "关键词" --kind subtitle,article
 | `biliyt check` | 检查依赖、JS Runtime、配置语法、代理 TCP 连通性与 Cookie 文件 | `-c/--config` |
 | `biliyt probe` | 探查投稿列表与 B 站扩展内容，统计已归档 / 过滤跳过 / 待下载数 | `-c/--config`, `-t/--target`, `-p/--platform`, `-n/--limit`, `--show` |
 | `biliyt sync` | 执行增量视频同步、B 站扩展归档或历史失败重试 | `-c/--config`, `-t/--target`, `-p/--platform`, `-n/--limit`, `--only`, `--full`, `--refresh-comments`, `--dry-run`, `--retry-failed` |
-| `biliyt status` | 汇总各目标累计视频/动态/专栏/评论归档数、失败队列与最近运行摘要 | `-c/--config` |
+| `biliyt status` | 汇总归档数、失败队列、部分完成 / 待索引 / 待修复条目数与最近运行摘要 | `-c/--config` |
+| `biliyt repair` | 默认只读预览；显式执行时补齐附件、元数据或重试索引 | `-c/--config`, `-t/--target`, `--only`, `--apply`, `-n/--limit` |
 | `biliyt db stats` | 查看 `state/biliyt.db` 体积与各数据表行数 | `-c/--config` |
-| `biliyt db rebuild` | 从本地 `downloads/` 零网络无损重建 SQLite 与全文索引 | `-c/--config`, `-t/--target`, `--reset` |
+| `biliyt db rebuild` | 从本地归档与运行报告离线导入；`--reset` 校验临时库后替换全库，禁与 `--target` 同用 | `-c/--config`, `-t/--target`, `--reset` |
 | `biliyt search <query>` | 在本地 SQLite 中跨视频、字幕、动态、专栏与评论全文检索 | `-c/--config`, `-t/--target`, `-k/--kind`, `-n/--limit` |
 
-`--only` 可按逗号组合模块：`profile,videos,dynamics,articles,favorites,comments`。`--kind` 支持过滤：`video,subtitle,dynamic,article,comment`。
+`sync --only` 可按逗号组合模块：`profile,videos,dynamics,articles,favorites,comments`。`search --kind` 支持：`video,subtitle,dynamic,article,comment`。
+
+### 补齐附件与恢复索引
+
+```bash
+# 默认只预览，不写入文件或数据库，不联网
+biliyt repair --target bili_example
+
+# 仅重试本地索引，无需重新下载媒体
+biliyt repair --target bili_example --only index --apply
+
+# 每个目标最多处理 10 个内容条目；可组合所需修复类型
+biliyt repair --target bili_example --only metadata,subtitles,images --limit 10 --apply
+```
+
+`repair --only` 支持 `index,metadata,subtitles,images`；`--limit` 限制每个目标的内容条目数，同一条目的多个修复操作共同计为一条。字幕初版补齐独立字幕文件，已有视频的嵌入字幕需求仍为待处理，不重新封装视频。旧归档中无法判断是否曾请求的附件标为 `unknown`，默认不会因此批量联网补抓；显式关闭或平台明确不可用的附件也不循环修复。
+
+`status` 的“部分完成 / 待索引 / 待修复”均为基于已知清单的条目数，同一条目可同时出现在多列，不能相加作为总数；旧归档没有缺项计数也不表示附件已验证完整。媒体保存成功后若附件或索引失败，报告仍保留待修复信息。`sync`、`repair --apply` 与 `db rebuild` 共用写锁，写入重叠时退出码为 `3`；修复仍有失败返回 `2`，配置或参数错误返回 `1`。
+
+此次可靠性更新不新增必填配置或运行时依赖。配置会检查未知字段、日期及三层合并后的约束，详见[配置详解](docs/configuration.md)。
 
 ## 归档目录与数据边界
 
@@ -140,7 +160,8 @@ biliyt search "关键词" --kind subtitle,article
 ```text
 downloads/<platform>/<target_id>/
 ├── 2026-01-01 - 标题 [BVxxx].mp4 / .info.json / .srt / .jpg / .comments.md / .comments.json
-├── profile/                  # B 站 UP 主档案与合集（profile.md/.json, collections.json）
+├── .biliyt/manifests/         # 逐条产物清单、附件完成情况与索引状态
+├── profile/                  # 最新档案与合集；snapshots/ 保存带稳定 ID 的主页历史
 ├── dynamics/<日期 - ID>/     # B 站动态正文（dynamic.md/.json）、原图（images/）与精选评论
 ├── articles/<日期 - cvID>/   # B 站专栏（article.md/.json）、插图（images/）与精选评论
 └── favorites/                # 公开收藏夹元数据清单（不下载他人视频）
@@ -150,12 +171,14 @@ state/
 ├── archives/<target_id>.txt  # yt-dlp 与扩展归档幂等记录
 ├── failed.jsonl              # 失败重试队列（--retry-failed 自动消费）
 ├── last_run.json             # 最近一次运行摘要
-└── reports/                  # 每次正式同步的 JSON 明细报告
+└── reports/                  # 带 run_id 的正式同步与修复执行 JSON 报告
 ```
+
+备份需同时保留 `downloads/`（包含隐藏的 `.biliyt/manifests/` 与 `profile/snapshots/`）和 `state/`（尤其 `reports/`、`archives/`、`failed.jsonl`），并保存配置。数据库重建从现存文件恢复内容索引与历史，不会重新生成归档文本或失败队列；旧目录只剩最新主页时，已丢失的历史也无法从该文件还原。全库替换前通过 SQLite backup 留存原库副本，导入或校验出错会保留原库，详见[备份与重建 SOP](docs/sqlite-storage-sop.md)。
 
 ## 项目状态、开发与安全提醒
 
-- **当前状态**：`v0.1.0`（早期 Beta，个人持续维护）。离线单测包含 71 个 `pytest` 用例，GitHub Actions CI 覆盖 Ubuntu 与 Windows 下的 Python 3.11 / 3.12 / 3.13 及打包冒烟测试（macOS 基于标准 Python / `yt-dlp` 链路，暂未纳入 CI 实测）。
+- **当前状态**：`v0.1.0`（早期 Beta，个人持续维护）。测试保持全离线，GitHub Actions CI 覆盖 Ubuntu 与 Windows 下的 Python 3.11 / 3.12 / 3.13 及打包冒烟测试（macOS 基于标准 Python / `yt-dlp` 链路，暂未纳入 CI 实测）。
 - **平台兼容性说明**：B 站与 YouTube 的风控策略及前端接口会随时调整；遇到解析报错时优先升级 `yt-dlp`（参见 [故障排查指南](docs/troubleshooting.md)），遇到 B 站 `-352` / `-412` 风控时请降低频率并等待冷却。
 - **凭据安全红线**：`config.yaml`、`cookies/`、`state/`、`downloads/` 已列入 `.gitignore`，提交 Issue、PR 或日志前请务必清除 `SESSDATA`、`bili_jct`、Cookie 文件内容与代理账密。安全漏洞请勿公开提交 Issue，请按 [SECURITY.md](SECURITY.md) 私密上报。
 - **本地开发与测试**：运行 `uv run pytest -v`（全部离线）与 `uvx ruff check src tests`；贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，AI 编程助手上下文见 [AGENTS.md](AGENTS.md)。

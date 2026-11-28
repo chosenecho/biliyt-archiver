@@ -184,3 +184,31 @@ def test_render_profile_markdown() -> None:
     assert "# 未明子 (UID: 23191782)" in md
     assert "现实观察" in md
     assert "![头像](assets/01_a.jpg)" in md
+
+
+def test_image_localizer_records_each_result_and_propagates_circuit_breaker(tmp_path) -> None:
+    import pytest
+
+    from biliyt.bilibili.client import BilibiliRiskControlError
+    from biliyt.bilibili.render import ImageLocalizer
+
+    class Client:
+        def download_binary(self, url, *, referer=None):
+            if "fail" in url:
+                raise RuntimeError("HTTP 404")
+            if "risk" in url:
+                raise BilibiliRiskControlError("risk", code=-352)
+            return b"image", "image/png"
+    urls = ["https://example.com/good.png", "https://example.com/fail.jpg?token=secret"]
+    localizer = ImageLocalizer(Client())
+    mapping = localizer.localize(urls, tmp_path / "images")
+    assert list(mapping) == [urls[0]]
+    assert [a.status for a in localizer.last_artifacts] == ["complete", "failed"]
+    assert localizer.last_artifacts[1].path.startswith("images/")
+    assert localizer.last_artifacts[1].source_url == "https://example.com/fail.jpg"
+    assert localizer.last_artifacts[1].error == "HTTP 404"
+    disabled = ImageLocalizer(Client(), enabled=False)
+    assert disabled.localize(urls, tmp_path / "disabled") == {}
+    assert all(a.status == "disabled" for a in disabled.last_artifacts)
+    with pytest.raises(BilibiliRiskControlError):
+        localizer.localize(["https://example.com/risk.jpg"], tmp_path / "risk")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import random
 import threading
 import time
@@ -9,10 +10,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import yt_dlp
+from yt_dlp.postprocessor.common import PostProcessor
 
+from .artifacts import Artifact, ArtifactManifest, ArtifactStore, DownloadResult, clean_error
 from .bilibili.archiver import BilibiliArchiver, ExtendedProbeSummary
 from .config import ResolvedTarget
 from .options import build_daterange, build_download_opts, build_probe_opts, evaluate_video_filters
@@ -64,15 +68,18 @@ class _CaptureLogger:
             return
 
     def info(self, msg: str) -> None:
+        msg = clean_error(msg)
         if self._on_message:
             self._on_message("info", msg)
 
     def warning(self, msg: str) -> None:
+        msg = clean_error(msg)
         self.warnings.append(msg)
         if self._on_message:
             self._on_message("warning", msg)
 
     def error(self, msg: str) -> None:
+        msg = clean_error(msg)
         self.errors.append(msg)
         if self._on_message:
             self._on_message("error", msg)
@@ -140,6 +147,44 @@ def _without_subtitles(opts: dict[str, Any]) -> dict[str, Any]:
             if pp.get("key") not in {"FFmpegSubtitlesConvertor", "FFmpegEmbedSubtitle"}
         ]
     return fallback
+
+
+class _CollectArtifactsPP(PostProcessor):
+    """Observe final info after yt-dlp has merged, converted and moved all files."""
+
+    def __init__(self, callback: Callable[[DownloadResult], None]) -> None:
+        super().__init__()
+        self.callback = callback
+
+    def run(self, info: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+        final_media = Path(info["filepath"]) if info.get("filepath") else None
+        moves = info.get("__files_to_move") or {}
+
+        def final_path(raw: Any) -> Path | None:
+            if not raw:
+                return None
+            path = Path(str(moves.get(str(raw)) or raw))
+            if not path.is_file() and final_media:
+                path = final_media.parent / path.name
+            return path if path.is_file() else None
+
+        subtitles = info.get("requested_subtitles") or {}
+        result = DownloadResult(
+            item_id=str(info.get("id") or ""),
+            media_path=final_path(info.get("filepath")),
+            info_path=final_path(info.get("infojson_filename") or info.get("__infojson_filename")),
+            subtitle_paths={
+                lang: path for lang, sub in subtitles.items()
+                if (path := final_path(sub.get("filepath"))) is not None
+            },
+            requested_languages=list(subtitles),
+        )
+        for thumbnail in reversed(info.get("thumbnails") or []):
+            if path := final_path(thumbnail.get("filepath")):
+                result.thumbnail_path = path
+                break
+        self.callback(result)
+        return [], info
 
 
 class SyncEngine:
@@ -315,6 +360,12 @@ class SyncEngine:
 
         downloaded_flag = False
         logger = _CaptureLogger()
+        results: list[DownloadResult] = []
+        subtitle_error = ""
+
+        def collect(ydl: Any) -> None:
+            if hasattr(ydl, "add_post_processor"):
+                ydl.add_post_processor(_CollectArtifactsPP(results.append), when="after_move")
 
         def _progress_hook(data: dict[str, Any]) -> None:
             nonlocal downloaded_flag
@@ -334,9 +385,10 @@ class SyncEngine:
         try:
             try:
                 with self._ydl_factory(opts) as ydl:
+                    collect(ydl)
                     ydl.download([url])
             except yt_dlp.utils.DownloadError as exc:
-                err_msg = str(exc)
+                err_msg = clean_error(exc)
                 if _is_subtitle_download_error(err_msg) and (
                     opts.get("writesubtitles") or opts.get("writeautomaticsub")
                 ):
@@ -347,14 +399,16 @@ class SyncEngine:
                         title=title,
                         message=f"字幕下载失败（将跳过字幕继续下载视频）: {err_msg}",
                     )
+                    subtitle_error = clean_error(err_msg)
                     logger.errors.clear()
                     fallback_opts = _without_subtitles(opts)
                     try:
                         with self._ydl_factory(fallback_opts) as ydl:
+                            collect(ydl)
                             ydl.download([url])
                     except Exception as fallback_exc:
                         _merge_temp_archive()
-                        fb_msg = str(fallback_exc)
+                        fb_msg = clean_error(fallback_exc)
                         self.state.record_failure(
                             target_id=target.id,
                             platform=target.platform.value,
@@ -377,7 +431,7 @@ class SyncEngine:
                     return "failed", err_msg
             except Exception as exc:
                 _merge_temp_archive()
-                err_msg = str(exc)
+                err_msg = clean_error(exc)
                 self.state.record_failure(
                     target_id=target.id,
                     platform=target.platform.value,
@@ -398,7 +452,16 @@ class SyncEngine:
 
         if downloaded_flag or bool(added_entries):
             self.state.remove_failure(target.id, url)
-            self._index_downloaded_video(target, video_id)
+            try:
+                self._index_downloaded_video(
+                    target, video_id, results=results, source_url=url, subtitle_error=subtitle_error,
+                )
+            except Exception as exc:
+                detail = f"媒体已保存，产物清单写入失败: {clean_error(exc)}"
+                self.state.record_failure(target_id=target.id, platform=target.platform.value,
+                                          url=url, video_id=video_id, title=title, error=detail)
+                self._emit("item_warning", target_id=target.id, url=url, message=detail)
+                return "failed", detail
             return "downloaded", "ok"
 
         # If yt-dlp exited cleanly without downloading or archiving, it was either
@@ -418,30 +481,104 @@ class SyncEngine:
         self.state.remove_failure(target.id, url)
         return "filtered", "被过滤条件或日期区间跳过"
 
-    def _index_downloaded_video(self, target: ResolvedTarget, video_id: str | None) -> None:
-        """Best-effort upsert of newly downloaded video's `.info.json` + `.srt` into SQLite."""
+    def _index_downloaded_video(
+        self, target: ResolvedTarget, video_id: str | None, *,
+        results: list[DownloadResult] | None = None, source_url: str = "", subtitle_error: str = "",
+    ) -> None:
+        """Persist actual artifact coordinates before attempting the derived SQLite index."""
         from .db import ArchiveDB, index_video_info_file
 
-        search_dirs = [target.download_dir]
-        if (target.download_dir / "videos").is_dir():
-            search_dirs.append(target.download_dir / "videos")
-
-        matched: list[Any] = []
-        for d in search_dirs:
-            if not d.exists():
+        store = ArtifactStore(target.download_dir, target.id)
+        collected = {r.item_id: r for r in (results or []) if r.item_id}
+        if not collected:
+            # Legacy/custom adapters may not implement postprocessors. Match JSON identity,
+            # never the user's configurable filename template.
+            for path in target.download_dir.rglob("*.info.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    item_id = str(data.get("id") or "")
+                except (OSError, ValueError, AttributeError):
+                    continue
+                if video_id and (item_id == video_id or item_id.startswith(f"{video_id}_p")):
+                    collected[item_id] = DownloadResult(item_id, info_path=path)
+        if not collected and video_id:
+            collected[video_id] = DownloadResult(video_id)
+        for result in collected.values():
+            artifacts = []
+            for kind, path, enabled in (
+                ("media", result.media_path, True),
+                ("metadata", result.info_path, target.media.write_info_json),
+                ("thumbnail", result.thumbnail_path, target.media.write_thumbnail),
+            ):
+                artifacts.append(Artifact(
+                    kind, "complete" if path else ("unknown" if enabled else "disabled"),
+                    store.relative(path) if path else None,
+                ))
+            for language, path in result.subtitle_paths.items():
+                artifacts.append(Artifact("subtitle", "complete", store.relative(path), language=language))
+            if subtitle_error:
+                for language in target.media.subtitle_langs:
+                    if language not in result.subtitle_paths:
+                        artifacts.append(Artifact("subtitle", "failed", language=language, error=subtitle_error))
+            elif not result.subtitle_paths:
+                artifacts.append(Artifact(
+                    "subtitle", "unavailable" if (target.media.write_subtitles or target.media.write_auto_subtitles) else "disabled",
+                ))
+            if target.media.embed_subtitles and (target.media.write_subtitles or target.media.write_auto_subtitles):
+                artifacts.append(Artifact(
+                    "subtitle_embed", "pending" if subtitle_error else ("complete" if result.media_path else "unknown"),
+                    store.relative(result.media_path) if result.media_path and not subtitle_error else None,
+                    error="独立字幕补齐后仍需重封装；当前 repair 不修改已保存视频" if subtitle_error else "",
+                ))
+            manifest = ArtifactManifest(
+                target.id, "video", result.item_id, source_url, artifacts,
+                index_status="pending" if target.media.write_info_json else "disabled",
+                context={"metadata_path": store.relative(result.info_path)} if result.info_path else {},
+            )
+            store.save(manifest)
+            if manifest.index_status == "disabled":
+                self._emit("item_warning", target_id=target.id, url=source_url,
+                           message="元数据保存已关闭，此条目的离线重建和索引不可用")
                 continue
-            for p in d.glob("*.info.json"):
-                if video_id and f"[{video_id}]" in p.name:
-                    matched.append(p)
-        if not matched:
-            return
+            try:
+                if not result.info_path:
+                    raise ValueError("下载完成但未获取元数据文件路径")
+                with self._db_lock:
+                    with ArchiveDB(self.state.state_dir / "biliyt.db") as db:
+                        paths = {"media": result.media_path, "thumbnail": result.thumbnail_path}
+                        if result.subtitle_paths:
+                            paths["subtitle"] = next(iter(result.subtitle_paths.values()))
+                        if not index_video_info_file(db, target, result.info_path, paths=paths):
+                            raise ValueError("元数据格式异常，索引待重试")
+                manifest.index_status = "complete"
+            except Exception as exc:
+                manifest.index_status = "failed"
+                manifest.index_error = clean_error(exc)
+                self._emit("item_warning", target_id=target.id, url=source_url,
+                           message=f"视频已保存，索引待修复: {manifest.index_error}")
+            store.save(manifest)
+
+    def _summarize_artifacts(self, target: ResolvedTarget, summary: TargetRunSummary) -> None:
         try:
-            with self._db_lock:
-                with ArchiveDB(self.state.state_dir / "biliyt.db") as db:
-                    for info_file in matched:
-                        index_video_info_file(db, target, info_file)
-        except Exception:
-            pass
+            manifest_errors: list[str] = []
+            stats = ArtifactStore(target.download_dir, target.id).stats(errors=manifest_errors)
+            summary.errors.extend(manifest_errors)
+            summary.failed += len(manifest_errors)
+            summary.partial = stats["partial"]
+            summary.index_failed = stats["index_failed"]
+            summary.pending_repair = stats["pending_repair"]
+            for manifest in ArtifactStore(target.download_dir, target.id).manifests():
+                if manifest.index_error:
+                    summary.warnings.append(f"{manifest.kind}/{manifest.item_id}: {manifest.index_error}")
+                for artifact in manifest.artifacts:
+                    if artifact.status in {"failed", "pending"}:
+                        summary.warnings.append(
+                            f"{manifest.kind}/{manifest.item_id} {artifact.kind}"
+                            f" {artifact.language or ''}: {artifact.error or '待补齐'}"
+                        )
+        except Exception as exc:
+            summary.errors.append(f"归档清单读取失败: {clean_error(exc)}")
+            summary.failed += 1
 
     def _sleep_between_items(self, target: ResolvedTarget) -> None:
         low = target.rate_limit.sleep_interval
@@ -651,6 +788,8 @@ class SyncEngine:
                 summary.failed += mod_stats.failed
                 summary.errors.extend(mod_stats.errors)
 
+        if not dry_run:
+            self._summarize_artifacts(target, summary)
         return summary
 
     def retry_failed(
@@ -721,6 +860,7 @@ class SyncEngine:
                 if idx < len(recs):
                     self._sleep_between_items(target)
 
+            self._summarize_artifacts(target, summary)
             summaries.append(summary)
 
         return summaries

@@ -10,6 +10,12 @@
 
 > 局部覆盖机制：在 `targets[i]` 中只填写需要修改的字段即可，未填写的字段会自动继承全局或平台配置。
 
+局部配置仅校验已填写字段的类型和范围，不使用局部默认值调整其他字段。合并完成后再校验最终配置和跨字段约束；配置加载时即检查所有目标（包括 `enabled: false` 的目标），合并错误包含目标 ID 和配置字段路径。例如全局 `min_duration: 300` 与目标 `max_duration: 60` 会报错。
+
+所有配置层级都会检查未知字段，拼错字段名会立即报错；旧版本曾静默忽略这类字段。`extractor_args` 仍允许 yt-dlp 提取器自定义键。
+
+未填写的字段表示继承；显式 `null` 仅可清空本身允许为空的字段，例如 `media.max_height`、`filters.date_after`、`filters.early_stop_after`、`auth.cookies_file`、`proxy`、`js_runtime`。布尔开关、休眠秒数等非空字段填写 `null` 会报错。整个可选覆盖节（如 `targets[i].filters: null`）表示没有该节的覆盖，继续继承。
+
 ---
 
 ## 1. `paths`：目录与命名模板
@@ -97,7 +103,7 @@ filters:
 | `recent_limit` | `int \| null` | 探查阶段最多拉取目标最新 N 条投稿（对应 yt-dlp `playlistend`）。定时增量同步建议设为 `10~50`，避免翻页触发风控。 |
 | `max_downloads` | `int \| null` | 单次同步每个目标最多实际下载的新视频条数。 |
 | `early_stop_after` | `int \| null` | 增量探查早停阈值（默认 `3`）：配合 `lazy_playlist` 连续遇到 N 条已归档视频即停止向后翻页；`--full` 自动忽略，`null` 关闭。 |
-| `date_after` / `date_before` | `str \| null` | 发布日期区间，支持 `YYYYMMDD`（如 `"20260101"`）或相对日期（如 `"now-7days"`、`"now-1month"`）。 |
+| `date_after` / `date_before` | `str \| null` | 发布日期闭区间，日期请加引号。支持真实日历日期 `YYYYMMDD`（如 `"20260101"`）、`now` / `today` / `yesterday`，以及这些基准减去整数个 `day` / `week` / `month` / `year`（可加复数 `s`，如 `"now-7days"`、`"now-1month"`）。加载时按 yt-dlp 日期语义解析，开始日期须早于或等于结束日期；`null` 清空该端限制。 |
 | `min_duration` / `max_duration` | `int \| null` | 视频时长门槛（单位：秒）。 |
 | `include_keywords` | `list[str]` | 白名单关键词（匹配标题或标签，不区分大小写，命中任一即通过）。 |
 | `exclude_keywords` | `list[str]` | 黑名单关键词（匹配标题或标签，不区分大小写，命中任一即跳过）。 |
@@ -120,7 +126,7 @@ rate_limit:
   rate_limit: null
 ```
 
-- `sleep_interval` / `max_sleep_interval`：相邻两个视频下载之间随机休眠的秒数区间。
+- `sleep_interval` / `max_sleep_interval`：相邻两个视频下载之间随机休眠的秒数区间。仅覆盖一端时另一端继续继承；最终合并后，非零最大值小于最小值时会提升至最小值，保留 `max_sleep_interval: 0` 的既有语义。
 - `sleep_requests`：请求平台元数据接口的最小间隔秒数。
 - `concurrent_fragments`：单个视频 DASH/HLS 分片的并发下载线程数（建议 `4~8`）。
 - `concurrency`：单个目标内的视频并行下载任务数（范围 `1~8`，默认 `1`；提高并行度可加快大批量补档，但会提高 B 站/YouTube 触发风控的概率）。
@@ -229,6 +235,8 @@ platforms:
         max_sub_replies_per_root: 20
         refresh_recent_days: 0   # 自动增量刷新最近 N 天内发布内容的评论（含 12 小时冷却；0 表示关闭）
 ```
+
+`api_sleep_min` / `api_sleep_max` 也在平台与目标配置合并后才调整：最终最大值小于最小值时会提升至最小值。`comments` 内部按显式字段逐项继承。
 
 配合 `biliyt sync` 可按模块精准执行：
 - `biliyt sync --only profile,favorites`

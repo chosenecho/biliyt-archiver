@@ -5,6 +5,10 @@
 ## [Unreleased]
 
 ### Added
+- `biliyt repair`：默认只读预览，`--apply` 执行，支持 `--only index,metadata,subtitles,images` 和每目标按内容条目计数的 `--limit`；整合失败队列与附件缺项，重试本地索引或补齐独立字幕、元数据、图片。
+- 每目标 `.biliyt/manifests/` 逐条产物清单，记录实际相对路径、附件完成状态与索引状态；`status` 和运行报告增加部分完成、待索引、待修复条目数，计数可重叠。
+- 主页历史追加保存到 `profile/snapshots/`；快照采用稳定 `snapshot_id`，运行报告包含 `run_id` 且文件名防同秒覆盖。
+- 数据库 v2 按版本迁移，为主页快照与运行记录增加稳定标识及唯一索引，离线导入相同历史保持幂等。
 - 开源治理与发布基建：`LICENSE`（MIT）、`CONTRIBUTING.md`、`SECURITY.md`、`CHANGELOG.md`、`AGENTS.md`、GitHub Issue/PR 模板、Dependabot 配置与 GitHub Actions CI/Release 工作流。
 - `biliyt init` 支持在打包安装（wheel / `uv tool`）场景下自动回退读取内置的 `config.example.yaml` 模板。
 - 新增静态 SVG 品牌标识 [docs/assets/biliyt-logo.svg](docs/assets/biliyt-logo.svg)。
@@ -16,6 +20,10 @@
   - 视频增量探查支持基于 `playlist_count` / `n_entries` 检测 B 站多 P 视频后续追加分 P。
 
 ### Changed
+- `db rebuild --target` 保持增量导入，禁止与全库 `--reset` 组合；全库重建先通过 SQLite backup 保留原库并导出独有历史，在同目录临时库完成导入、完整性及计数校验后再处理 WAL、关闭连接并替换。导入或替换失败保留原库并报告错误及已有备份路径。
+- `sync`、`repair --apply`、`db rebuild` 共用写锁，统一提示其他写入正在进行；锁冲突退出码为 `3`，部分处理失败为 `2`，配置或参数错误为 `1`。
+- 备份说明明确涵盖 `downloads/`（含隐藏产物清单与主页历史）和 `state/`（含报告、归档文本、失败队列）；重建恢复现存内容和运行历史，不承诺恢复旧归档中已经丢失的信息。
+- 本轮不新增必填配置或运行时依赖；旧归档 `unknown` 附件不自动批量联网补抓，字幕修复初版仅补独立字幕文件，不重封装已有视频。
 - 重写 `README.md` 信息架构，以跨平台全局 `biliyt` CLI（`uv tool install`）为首选入口，补充与原生 `yt-dlp` 的差异化对比、非目标边界、真实 CLI 输出示例与诚实的项目状态声明。
 - 在 `config.example.yaml` 与 `docs/configuration.md` 中补齐 `paths.temp_dir` 与 `rate_limit.concurrency` 配置文档。
 - 清理文档中的本机绝对路径引用，完善 `pyproject.toml` 发布元数据与 Ruff 规则。
@@ -24,6 +32,9 @@
 - 移除仅限 Windows 源码目录的 `biliyt.cmd` 批处理包装脚本，统一使用跨平台 `biliyt` CLI 入口（`[project.scripts]` / `python -m biliyt`）。
 
 ### Fixed
+- 局部配置只合并显式字段，延迟依赖默认值的跨字段规范化；最终合并后正式校验并附目标 ID 和配置路径，保留 `null` 语义，检查未知字段、日期格式与起止顺序。此前静默忽略的拼错字段会开始报错。
+- 视频索引消费后处理后的实际产物路径，覆盖自定义文件名、分 P、格式转换与临时目录搬运；索引失败与字幕降级以结构化警告和待修复状态保留。
+- 状态、报告、元数据及清单等文件采用同目录临时写入后原子替换，降低中断留下截断文件的概率；断电持久性仍取决于操作系统与文件系统。
 - 修复 `src/biliyt/bilibili/client.py` 中多余的 f-string（Ruff `F541`）。
 - 修复并发视频下载（`rate_limit.concurrency > 1`）时多个 worker 竞争写入同一 `download_archive` 文件及 `newly_archived` 跨线程误判问题，改为每任务独立临时归档文件并持 `StateStore` 锁原子合并。
 - 修复 `StateStore` 命名空间归档读写未加锁及 `retry_failed_item` 重试失败评论后未同步写入 SQLite 数据库的问题。
